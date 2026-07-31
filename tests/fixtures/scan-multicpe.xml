@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<!-- Nmap 7.94 scan initiated Mon Jun  1 09:14:03 2026 as: nmap -sV -oX scan-multicpe.xml 192.168.50.40 -->
+<nmaprun scanner="nmap" args="nmap -sV -oX scan-multicpe.xml 192.168.50.40" start="1780312443" version="7.94" xmloutputversion="1.05">
+  <scaninfo type="connect" protocol="tcp" numservices="1000" services="1-1000"/>
+  <host starttime="1780312443" endtime="1780312471">
+    <status state="up" reason="syn-ack" reason_ttl="0"/>
+    <address addr="192.168.50.40" addrtype="ipv4"/>
+    <ports>
+      <!-- One service declaring TWO application CPEs (Apache httpd + mod_php) —
+           the regression case: the second CPE used to be silently dropped.
+           The php CPE carries no version, and must NOT inherit Apache's
+           version attribute. -->
+      <port protocol="tcp" portid="80">
+        <state state="open" reason="syn-ack" reason_ttl="0"/>
+        <service name="http" product="Apache httpd" version="2.4.41" extrainfo="(Ubuntu) PHP/7.4.3" method="probed" conf="10">
+          <cpe>cpe:/a:apache:http_server:2.4.41</cpe>
+          <cpe>cpe:/a:php:php</cpe>
+          <cpe>cpe:/o:linux:linux_kernel</cpe>
+        </service>
+      </port>
+    </ports>
+  </host>
+  <runstats>
+    <finished time="1780312471" summary="Nmap done; 1 IP address (1 host up) scanned in 28.04 seconds" elapsed="28.04" exit="success"/>
+    <hosts up="1" down="0" total="1"/>
+  </runstats>
+</nmaprun>

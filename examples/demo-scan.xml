@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<!-- Nmap 7.94 scan initiated as: nmap -sV -oX demo-scan.xml 10.20.0.0/28 -->
+<!-- Synthetic demo asset: a plausible DMZ sweep with nginx/openssh CVE hits,
+     plus three CISA-KEV matches (Confluence, FortiClient EMS, Langflow)
+     so the ranked playbook leads with KEV entries. -->
+<nmaprun scanner="nmap" args="nmap -sV -oX demo-scan.xml 10.20.0.0/28" start="1780680000" version="7.94" xmloutputversion="1.05">
+  <scaninfo type="connect" protocol="tcp" numservices="1000" services="1-1000"/>
+  <host>
+    <status state="up" reason="syn-ack"/>
+    <address addr="10.20.0.10" addrtype="ipv4"/>
+    <hostnames><hostname name="web01.dmz.local" type="PTR"/></hostnames>
+    <ports>
+      <port protocol="tcp" portid="22">
+        <state state="open" reason="syn-ack"/>
+        <service name="ssh" product="OpenSSH" version="9.6p1 Ubuntu 3ubuntu13" extrainfo="Ubuntu Linux; protocol 2.0" method="probed" conf="10">
+          <cpe>cpe:/a:openbsd:openssh:9.6p1</cpe>
+          <cpe>cpe:/o:linux:linux_kernel</cpe>
+        </service>
+      </port>
+      <port protocol="tcp" portid="443">
+        <state state="open" reason="syn-ack"/>
+        <service name="http" product="nginx" version="1.18.0" tunnel="ssl" method="probed" conf="10">
+          <cpe>cpe:/a:f5:nginx:1.18.0</cpe>
+        </service>
+      </port>
+    </ports>
+  </host>
+  <host>
+    <status state="up" reason="syn-ack"/>
+    <address addr="10.20.0.20" addrtype="ipv4"/>
+    <hostnames><hostname name="collab01.dmz.local" type="PTR"/></hostnames>
+    <ports>
+      <port protocol="tcp" portid="8090">
+        <state state="open" reason="syn-ack"/>
+        <service name="http" product="Atlassian Confluence" version="8.0.0" method="probed" conf="10">
+          <cpe>cpe:/a:atlassian:confluence_server:8.0.0</cpe>
+        </service>
+      </port>
+    </ports>
+  </host>
+  <host>
+    <status state="up" reason="syn-ack"/>
+    <address addr="10.20.0.30" addrtype="ipv4"/>
+    <hostnames><hostname name="mgmt01.dmz.local" type="PTR"/></hostnames>
+    <ports>
+      <port protocol="tcp" portid="8013">
+        <state state="open" reason="syn-ack"/>
+        <service name="http" product="FortiClient Endpoint Management Server" version="7.4.4" method="probed" conf="10">
+          <cpe>cpe:/a:fortinet:forticlientems:7.4.4</cpe>
+        </service>
+      </port>
+    </ports>
+  </host>
+  <host>
+    <status state="up" reason="syn-ack"/>
+    <address addr="10.20.0.40" addrtype="ipv4"/>
+    <hostnames><hostname name="ai01.dmz.local" type="PTR"/></hostnames>
+    <ports>
+      <port protocol="tcp" portid="7860">
+        <state state="open" reason="syn-ack"/>
+        <service name="http" product="Langflow" version="1.2.0" method="probed" conf="10">
+          <cpe>cpe:/a:langflow:langflow:1.2.0</cpe>
+        </service>
+      </port>
+    </ports>
+  </host>
+  <runstats>
+    <finished time="1780680110" summary="Nmap done; 16 IP addresses (4 hosts up) scanned in 110.21 seconds" elapsed="110.21" exit="success"/>
+    <hosts up="4" down="12" total="16"/>
+  </runstats>
+</nmaprun>

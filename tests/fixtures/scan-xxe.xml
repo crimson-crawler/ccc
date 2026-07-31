@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun [
+  <!ENTITY xxe SYSTEM "file:///etc/passwd">
+]>
+<nmaprun scanner="nmap" version="7.94">
+  <host>
+    <status state="up"/>
+    <address addr="10.9.9.9" addrtype="ipv4"/>
+    <ports>
+      <port protocol="tcp" portid="80">
+        <state state="open"/>
+        <service name="http" product="&xxe;" version="1.0"/>
+      </port>
+    </ports>
+  </host>
+</nmaprun>

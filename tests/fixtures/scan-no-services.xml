@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<!-- Nmap 7.94: a ping/port scan without -sV — ports open but no product data. -->
+<nmaprun scanner="nmap" args="nmap -oX scan-no-services.xml 172.16.0.5" start="1775556400" version="7.94" xmloutputversion="1.05">
+  <scaninfo type="connect" protocol="tcp" numservices="100" services="1-100"/>
+  <host>
+    <status state="up" reason="syn-ack"/>
+    <address addr="172.16.0.5" addrtype="ipv4"/>
+    <ports>
+      <port protocol="tcp" portid="22">
+        <state state="open" reason="syn-ack"/>
+        <service name="ssh" method="table" conf="3"/>
+      </port>
+      <port protocol="tcp" portid="80">
+        <state state="open" reason="syn-ack"/>
+        <service name="http" method="table" conf="3"/>
+      </port>
+    </ports>
+  </host>
+  <runstats>
+    <finished time="1775556410" summary="Nmap done" elapsed="10.02" exit="success"/>
+    <hosts up="1" down="0" total="1"/>
+  </runstats>
+</nmaprun>

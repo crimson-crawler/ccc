@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<!-- Nmap 7.94 scan initiated as: nmap -sV -oX scan-multihost.xml 10.0.0.0/29 -->
+<nmaprun scanner="nmap" args="nmap -sV -oX scan-multihost.xml 10.0.0.0/29" start="1775556200" version="7.94" xmloutputversion="1.05">
+  <scaninfo type="connect" protocol="tcp" numservices="1000" services="1-1000"/>
+  <host>
+    <status state="up" reason="syn-ack"/>
+    <address addr="10.0.0.1" addrtype="ipv4"/>
+    <ports>
+      <port protocol="tcp" portid="22">
+        <state state="open" reason="syn-ack"/>
+        <service name="ssh" product="OpenSSH" version="8.9p1" method="probed" conf="10">
+          <cpe>cpe:/a:openbsd:openssh:8.9p1</cpe>
+        </service>
+      </port>
+      <port protocol="tcp" portid="3306">
+        <state state="open" reason="syn-ack"/>
+        <service name="mysql" product="MySQL" version="8.0.36" method="probed" conf="10">
+          <cpe>cpe:/a:mysql:mysql:8.0.36</cpe>
+        </service>
+      </port>
+    </ports>
+  </host>
+  <host>
+    <status state="up" reason="syn-ack"/>
+    <address addr="10.0.0.2" addrtype="ipv4"/>
+    <ports>
+      <port protocol="tcp" portid="22">
+        <state state="open" reason="syn-ack"/>
+        <service name="ssh" product="OpenSSH" version="8.9p1" method="probed" conf="10">
+          <cpe>cpe:/a:openbsd:openssh:8.9p1</cpe>
+        </service>
+      </port>
+      <port protocol="tcp" portid="6379">
+        <state state="open" reason="syn-ack"/>
+        <service name="redis" product="Redis key-value store" version="7.2.4" method="probed" conf="10">
+          <cpe>cpe:/a:redislabs:redis:7.2.4</cpe>
+        </service>
+      </port>
+    </ports>
+  </host>
+  <host>
+    <status state="up" reason="syn-ack"/>
+    <address addr="10.0.0.3" addrtype="ipv4"/>
+    <ports>
+      <port protocol="tcp" portid="8080">
+        <state state="open" reason="syn-ack"/>
+        <!-- No CPE child: exercises the product/version attribute fallback. -->
+        <service name="http" product="Jetty" version="9.4.53.v20231009" method="probed" conf="10"/>
+      </port>
+      <port protocol="tcp" portid="9090">
+        <state state="open" reason="syn-ack"/>
+        <!-- Unidentified service: name only, no product — must be skipped. -->
+        <service name="zeus-admin" method="table" conf="3"/>
+      </port>
+    </ports>
+  </host>
+  <host>
+    <status state="down" reason="no-response"/>
+    <address addr="10.0.0.4" addrtype="ipv4"/>
+  </host>
+  <runstats>
+    <finished time="1775556290" summary="Nmap done; 8 IP addresses (4 hosts up) scanned in 89.41 seconds" elapsed="89.41" exit="success"/>
+    <hosts up="4" down="4" total="8"/>
+  </runstats>
+</nmaprun>

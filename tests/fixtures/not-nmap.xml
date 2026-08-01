@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<report>
+  <finding severity="high">This is some other scanner's XML, not nmap.</finding>
+</report>

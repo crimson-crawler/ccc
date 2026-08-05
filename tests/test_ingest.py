@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+from crimson_crawler_cli import playbook
 from crimson_crawler_cli.cli import app
 from crimson_crawler_cli.exceptions import ExitCode
 from crimson_crawler_client import UnexpectedStatus
@@ -73,8 +74,7 @@ class TestIngestMarkdown:
         _wire(mock_sdk)
         result = runner.invoke(app, ["ingest", "nmap", str(_scan_file(tmp_path))])
         assert result.exit_code == ExitCode.OK
-        assert "Recommended actions" in result.output
-        assert "CVE-2021-44228" in result.output and "[KEV]" in result.output
+        assert "CVE\\-2021\\-44228" in result.output and "[KEV]" in result.output
         assert "Findings by asset" in result.output and "Apache httpd" in result.output
         assert "Errors" in result.output and "openssl" in result.output
         mock_sdk.inventory_manager.parse_scan.assert_awaited_once_with("<nmaprun/>", "nmap")
@@ -88,6 +88,63 @@ class TestIngestMarkdown:
         _wire(mock_sdk)
         result = runner.invoke(app, ["ingest", "nmap", str(_scan_file(tmp_path)), "--expand"])
         assert "D" * 600 in result.output
+
+    @pytest.mark.parametrize(
+        "untrusted",
+        [
+            "# injected heading",
+            "[deceptive](https://example.invalid)",
+            "![tracking pixel](https://example.invalid/pixel)",
+            "<img src=x onerror=1>",
+            "```danger```",
+            "first | second",
+            "first line\nsecond line\r\nthird line\x00",
+        ],
+    )
+    def test_untrusted_scalars_are_escaped_everywhere(self, untrusted: str) -> None:
+        briefing = {
+            "format": untrusted,
+            "parsed_count": untrusted,
+            "recommended_actions": [
+                {
+                    "cve_id": untrusted,
+                    "product": untrusted,
+                    "weaponization_score": untrusted,
+                    "reason": untrusted,
+                }
+            ],
+            "report": {
+                "summary": {
+                    "total_cves": untrusted,
+                    "total_kev": untrusted,
+                    "max_weaponization": untrusted,
+                },
+                "assets": [
+                    {
+                        "product": untrusted,
+                        "vendor": untrusted,
+                        "status": "ok",
+                        "cve_count": untrusted,
+                        "kev_count": untrusted,
+                        "max_weaponization": untrusted,
+                        "top_cves": [
+                            {
+                                "cve_id": untrusted,
+                                "cvss_score": untrusted,
+                                "epss": untrusted,
+                                "description": untrusted,
+                            }
+                        ],
+                    },
+                    {"product": untrusted, "status": "error", "errors": [untrusted]},
+                ],
+            },
+        }
+
+        rendered = playbook.render_briefing(briefing, scan_file=untrusted, expand=True)
+        escaped = playbook.escape_markdown_scalar(untrusted)
+        assert "\n" not in escaped and "\r" not in escaped and "\x00" not in escaped
+        assert rendered.count(escaped) >= 18
 
     def test_xlsx_reads_file_as_bytes(self, runner, authed, mock_sdk, tmp_path) -> None:
         # The binary format: the CLI reads the file as BYTES (not text) and forwards them; the SDK

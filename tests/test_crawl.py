@@ -10,6 +10,9 @@ an implementation detail tested only where it drives serialization.
 from __future__ import annotations
 
 import json
+import subprocess
+from pathlib import Path
+from typing import Any
 
 import pytest
 from typer.testing import CliRunner
@@ -224,6 +227,25 @@ def test_crawl_project_detects_python_deps(tmp_path):
     assert n_files == 1
 
 
+def test_crawl_does_not_follow_python_version_symlink_outside_project(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    sentinel = tmp_path / "sentinel.txt"
+    sentinel_value = "9.9.9-outside-sentinel"
+    sentinel.write_text(sentinel_value, encoding="utf-8")
+    python_version = project / ".python-version"
+    python_version.symlink_to(sentinel)
+
+    linked_assets, _ = crawl.crawl(project)
+    assert sentinel_value not in json.dumps(linked_assets)
+
+    python_version.unlink()
+    python_version.write_text("3.12.4\n", encoding="utf-8")
+    regular_assets, _ = crawl.crawl(project)
+    python = next(asset for asset in regular_assets if asset["product"] == "Python")
+    assert python["versions"] == ["3.12.4"]
+
+
 def test_crawl_project_excludes_dev_by_default(tmp_path):
     (tmp_path / "requirements-dev.txt").write_text("pytest==8.0\n")
     (tmp_path / "requirements.txt").write_text("flask==3.0\n")
@@ -286,12 +308,15 @@ def test_endpoint_os_distro_reads_id_lowercased():
     assert endpoint.os_distro("VERSION_ID=99\n") is None  # neither ID nor NAME
 
 
-def test_endpoint_collect_threads_distro_into_purls(tmp_path):
+def test_endpoint_collect_threads_distro_into_purls(tmp_path: Path) -> None:
     os_release = tmp_path / "os-release"
     os_release.write_text('ID=ubuntu\nNAME="Ubuntu"\nVERSION_ID="24.04"\n')
+    manager = tmp_path / "dpkg-query"
+    manager.write_text("", encoding="utf-8")
+    manager.chmod(0o700)
     assets = endpoint.collect(
         run=lambda argv: "curl\t8.5.0\n",
-        which=lambda b: "/x" if b == "dpkg-query" else None,
+        which=lambda binary: str(manager) if binary == "dpkg-query" else None,
         os_release_path=os_release,
     )
     curl = next(a for a in assets if a["product"] == "curl")
@@ -302,6 +327,46 @@ def test_endpoint_collect_threads_distro_into_purls(tmp_path):
     assert os_asset["product"] == "ubuntu"
     assert os_asset["ecosystem"] == "deb"
     assert os_asset["namespace"] == "ubuntu"
+
+
+def test_endpoint_executes_resolved_absolute_path_with_timeout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    manager = tmp_path / "dpkg-query"
+    manager.write_text("", encoding="utf-8")
+    manager.chmod(0o700)
+    observed: dict[str, Any] = {}
+
+    def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        observed["argv"] = argv
+        observed["timeout"] = kwargs.get("timeout")
+        return subprocess.CompletedProcess(argv, 0, "curl\t8.5.0\n", "")
+
+    monkeypatch.setattr(endpoint.subprocess, "run", fake_run)
+    endpoint.collect(
+        which=lambda binary: str(manager) if binary == "dpkg-query" else None,
+        os_release_path=tmp_path / "absent",
+    )
+
+    assert observed["argv"][0] == str(manager.resolve())
+    assert observed["argv"][0].startswith("/")
+    assert observed["timeout"] == 30
+
+
+def test_endpoint_package_manager_timeout_degrades_to_bad_input(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    manager = tmp_path / "rpm"
+    manager.write_text("", encoding="utf-8")
+    manager.chmod(0o700)
+
+    def time_out(argv: list[str], **kwargs: Any) -> None:
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    monkeypatch.setattr(endpoint.subprocess, "run", time_out)
+    with pytest.raises(BadInputError, match="timed out"):
+        endpoint.collect(
+            which=lambda binary: str(manager) if binary == "rpm" else None,
+            os_release_path=tmp_path / "absent",
+        )
 
 
 def test_endpoint_collect_raises_without_package_manager(tmp_path):

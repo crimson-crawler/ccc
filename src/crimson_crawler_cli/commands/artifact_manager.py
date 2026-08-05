@@ -201,7 +201,7 @@ def get_command(
 
     raw = with_status("Fetching artifact…", _call())
     if out is not None:
-        out.write_text(raw["content"], encoding="utf-8")
+        paths.write_atomic(out, raw["content"])
         summary = {k: raw[k] for k in ("id", "kind", "name", "format", "mime")}
         summary["saved_to"] = str(out)
         summary["bytes"] = len(raw["content"].encode())
@@ -289,7 +289,7 @@ def export_command(
     _ensure_new_output(target)
     # Write the authoritative RAW bytes — correct for text formats AND the binary XLSX deliverables
     # (emass/workbook); `exp["content"]` is a lossy text decode that would corrupt a spreadsheet.
-    target.write_bytes(exp["bytes"])
+    paths.write_atomic(target, exp["bytes"], overwrite=False)
     payload = {
         "saved_to": str(target),
         "filename": exp["filename"],
@@ -325,7 +325,7 @@ def export_all_command(
 
     data = with_status("Downloading all exports…", _call())
     target = out if out is not None else Path(f"{enrichment_id}-exports.zip")
-    target.write_bytes(data)
+    paths.write_atomic(target, data, overwrite=False)
     payload = {"saved_to": str(target), "bytes": len(data)}
     output.render(
         payload,
@@ -661,7 +661,7 @@ def download_folder_command(
 
     data = with_status("Downloading folder…", _call())
     target = out if out is not None else Path(f"{folder_id}-folder.zip")
-    target.write_bytes(data)
+    paths.write_atomic(target, data, overwrite=False)
     payload = {"saved_to": str(target), "bytes": len(data)}
     output.render(
         payload, lambda c, p: c.print(f"[green]Saved[/green] folder → {p['saved_to']} ({_fmt_bytes(p['bytes'])})")
@@ -688,7 +688,7 @@ def download_bundle_command(
 
     data = with_status("Bundling artifacts…", _call())
     target = out if out is not None else Path("artifacts.zip")
-    target.write_bytes(data)
+    paths.write_atomic(target, data, overwrite=False)
     payload = {"saved_to": str(target), "bytes": len(data), "count": len(artifact_ids)}
     output.render(
         payload,

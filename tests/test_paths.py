@@ -1,8 +1,7 @@
-"""Unit tests for the ``paths.ensure_writable_output`` pre-flight helper.
+"""Unit tests for safe ``--output`` preflight and writes.
 
-No SDK, no network — pure local path validation. Guards that a bad
-``--output`` destination raises :class:`BadInputError` (exit 64) before any
-command reaches its API call.
+No SDK, no network: these cover early path validation, atomic replacement,
+exclusive creation, and restrictive output permissions.
 """
 
 from __future__ import annotations
@@ -13,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from crimson_crawler_cli.exceptions import BadInputError
-from crimson_crawler_cli.paths import ensure_writable_output
+from crimson_crawler_cli.paths import ensure_writable_output, write_atomic
 
 
 def test_existing_writable_parent_passes(tmp_path: Path) -> None:
@@ -95,3 +94,37 @@ def test_symlinked_parent_directory_is_allowed(tmp_path: Path) -> None:
     linked_dir = tmp_path / "linked"
     linked_dir.symlink_to(real_dir, target_is_directory=True)
     ensure_writable_output(linked_dir / "report.md")
+
+
+@pytest.mark.parametrize("data", ["safe text", b"safe bytes"])
+def test_atomic_write_replaces_symlink_planted_after_preflight(tmp_path: Path, data: str | bytes) -> None:
+    sentinel = tmp_path / "sentinel.txt"
+    sentinel.write_text("unchanged", encoding="utf-8")
+    destination = tmp_path / "output"
+
+    ensure_writable_output(destination)
+    destination.symlink_to(sentinel)
+    write_atomic(destination, data)
+
+    assert not destination.is_symlink()
+    assert sentinel.read_text(encoding="utf-8") == "unchanged"
+    if isinstance(data, str):
+        assert destination.read_text(encoding="utf-8") == data
+    else:
+        assert destination.read_bytes() == data
+
+
+def test_new_only_write_does_not_truncate_existing_file(tmp_path: Path) -> None:
+    destination = tmp_path / "export.zip"
+    destination.write_bytes(b"original")
+
+    with pytest.raises(FileExistsError):
+        write_atomic(destination, b"replacement", overwrite=False)
+
+    assert destination.read_bytes() == b"original"
+
+
+def test_new_only_write_uses_restrictive_permissions(tmp_path: Path) -> None:
+    destination = tmp_path / "export.zip"
+    write_atomic(destination, b"payload", overwrite=False)
+    assert destination.stat().st_mode & 0o777 == 0o600

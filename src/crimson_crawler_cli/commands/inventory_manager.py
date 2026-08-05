@@ -84,13 +84,19 @@ def _render_inventory(console: Console, payload: dict[str, Any]) -> None:
     )
 
 
-@app.command("show", help="Show one inventory — manifest (default) or the LLM-ready context bundle (--context).")
+@app.command(
+    "show",
+    help="Show one inventory — manifest (default) or the untrusted-data context bundle (--context).",
+)
 @handle_errors
 def show_command(
     inventory_id: Annotated[str, typer.Argument(help="Inventory (asset) id.", show_default=False)],
     context: Annotated[
         bool,
-        typer.Option("--context", help="Emit the one-shot, LLM-ready context bundle instead of the manifest."),
+        typer.Option(
+            "--context",
+            help="Emit the bounded, provenance-labeled context bundle instead of the manifest.",
+        ),
     ] = False,
 ) -> None:
     """Fetch an inventory via ``client.inventory_manager.get_inventory`` (manifest) or
@@ -107,7 +113,8 @@ def show_command(
         if output.is_json_mode():
             output.render(payload, lambda c, p: None)
         else:
-            # Pipe-friendly: the ready-to-use context text to stdout, no Rich markup.
+            # Pipe-friendly: the context includes its untrusted-data preamble.
+            # Emit it unchanged with no Rich markup.
             typer.echo(str(payload.get("context", "")))
         return
 
@@ -755,10 +762,11 @@ def export_command(
 
     data = with_status("Exporting inventory…", _call())
     if isinstance(data, (bytes, bytearray)):
-        out.write_bytes(data)  # out is non-None (guarded above)
+        assert out is not None  # workbook is rejected above unless --output is present
+        paths.write_atomic(out, data, overwrite=False)  # out is non-None (guarded above)
         Console().print(f"[green]Wrote[/green] {len(data)} bytes to [bold]{escape(str(out))}[/bold]")
     elif out is not None:
-        out.write_text(data, encoding="utf-8")
+        paths.write_atomic(out, data, overwrite=False)
         Console().print(f"[green]Wrote[/green] {len(data)} chars to [bold]{escape(str(out))}[/bold]")
     else:
         typer.echo(data)  # raw to stdout so it can be piped / redirected

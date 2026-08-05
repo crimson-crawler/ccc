@@ -22,6 +22,7 @@ import contextlib
 import json
 import os
 import re
+import stat
 import sys
 import tomllib
 from collections.abc import Callable, Iterator
@@ -232,19 +233,64 @@ def _rel(path: Path) -> str:
 
 MAX_MANIFEST_BYTES = 5 * 1024 * 1024
 
+# ``O_NOFOLLOW`` refuses a symlinked final component, which is the whole point:
+# an untrusted tree can name a manifest and point it somewhere sensitive.
+_READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NOCTTY", 0)
+
+
+def _confined(path: Path) -> bool:
+    """True when ``path`` resolves beneath the active crawl root.
+
+    ``crawl()`` resolves the root before scanning, so this is a plain ancestor
+    test. Outside a crawl scope (parsers called directly, as the unit tests do)
+    there is no root to confine to and the caller chose the path itself.
+    """
+    if _CURRENT_TARGET is None:
+        return True
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError:
+        return False
+    return resolved == _CURRENT_TARGET or _CURRENT_TARGET in resolved.parents
+
 
 def _read(path: Path) -> str | None:
+    """Read a manifest without following symlinks or leaving the crawl root.
+
+    Every parser funnels through here, so this is the single place the crawler
+    touches untrusted file content. A hostile repository can ship
+    ``.python-version -> /proc/self/environ`` and the parsers would otherwise
+    serialize whatever came back into the SBOM as a version string. Three
+    guards, in order: ``O_NOFOLLOW`` rejects a symlinked manifest, ``S_ISREG``
+    rejects FIFOs and devices (a FIFO would block the crawl indefinitely), and
+    ``_confined`` rejects anything that resolved outside the root anyway.
+    """
     try:
-        size = path.stat().st_size
-        if size > MAX_MANIFEST_BYTES:
+        fd = os.open(path, _READ_FLAGS)
+    except OSError:
+        # ELOOP here means the manifest was a symlink; treat it like any other
+        # unreadable file so one hostile entry cannot abort the crawl.
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            print(f"warning: skipped non-regular manifest {path}", file=sys.stderr)
+            return None
+        if st.st_size > MAX_MANIFEST_BYTES:
             print(
-                f"warning: skipped oversized manifest {path} ({size} bytes; limit is {MAX_MANIFEST_BYTES} bytes)",
+                f"warning: skipped oversized manifest {path} ({st.st_size} bytes; limit is {MAX_MANIFEST_BYTES} bytes)",
                 file=sys.stderr,
             )
             return None
-        return path.read_text(encoding="utf-8", errors="replace")
+        if not _confined(path):
+            print(f"warning: skipped manifest outside the crawl root {path}", file=sys.stderr)
+            return None
+        with os.fdopen(fd, encoding="utf-8", errors="replace", closefd=False) as handle:
+            return handle.read()
     except OSError:
         return None
+    finally:
+        os.close(fd)
 
 
 # ============================================================
@@ -1242,7 +1288,13 @@ def _walk(target: Path) -> Iterator[Path]:
     for dirpath, dirnames, filenames in os.walk(target, followlinks=False):
         dirnames[:] = [d for d in dirnames if d not in PRUNE_DIRS]
         for fname in filenames:
-            yield Path(dirpath) / fname
+            candidate = Path(dirpath) / fname
+            # ``followlinks=False`` stops traversal *into* symlinked directories
+            # but still yields symlinked files. ``_read`` refuses those too,
+            # skipping them here also keeps them out of the scanned-file count.
+            if candidate.is_symlink():
+                continue
+            yield candidate
 
 
 _REQ_FILE_RE = re.compile(r"^requirements.*\.(txt|in)$")

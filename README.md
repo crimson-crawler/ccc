@@ -39,7 +39,7 @@ Python 3.11+.
 Published on [PyPI](https://pypi.org/project/crimson-crawler-cli/).
 
 **Working from a source checkout:** source development depends on the co-released
-[`crimson-crawler-client` Python SDK](https://github.com/crimson-crawler/python-sdk) at tag `v4.1.0`.
+[`crimson-crawler-client` Python SDK](https://github.com/crimson-crawler/python-sdk) at tag `v4.1.1`.
 That repository must be publicly available before `uv sync --extra dev` can resolve the pinned SDK source.
 Until the SDK release is available, install the published CLI from PyPI instead of treating a source checkout
 as independently buildable. Once both repositories are released, contributors can run:
@@ -431,7 +431,7 @@ Both emit a CycloneDX 1.6 document:
   "specVersion": "1.6",
   "version": 1,
   "metadata": { "timestamp": "2026-06-26T14:03:00Z",
-                "tools": [{ "name": "ccc crawl", "version": "4.1.0" }] },
+                "tools": [{ "name": "ccc crawl", "version": "4.1.1" }] },
   "components": [
     { "type": "operating-system", "name": "ubuntu", "version": "24.04",
       "group": "ubuntu", "purl": "pkg:deb/ubuntu/ubuntu@24.04" },
@@ -537,7 +537,7 @@ Enricher (`/v1/inventory-enrich`) on your key — that submit counts toward your
 ```bash
 ccc inventory-manager list                          # your inventories, newest first
 ccc inventory-manager show <INVENTORY_ID>             # the inventory manifest
-ccc inventory-manager show <INVENTORY_ID> --context   # the LLM-ready context bundle
+ccc inventory-manager show <INVENTORY_ID> --context   # bounded, provenance-labeled context data
 ccc inventory-manager create "Crown Jewels"         # an empty inventory (add assets later)
 ccc inventory-manager import assets.json --format json          # create from an inventory file
 ccc inventory-manager import scan.xml --format nmap --into <ID> --append   # edit an existing inventory's assets
@@ -555,6 +555,11 @@ ccc inventory-manager favorite <INVENTORY_ID> --on    # star / unstar the invent
 ccc inventory-manager apply-fix <INVENTORY_ID> <PRODUCT> <VERSION> [--vendor V]   # apply a recommended upgrade to one asset
 ccc inventory-manager delete <INVENTORY_ID>
 ```
+
+The `--context` output starts with a safe prompt preamble and puts source metadata and explicit
+delimiters around artifact-derived sections.
+
+> **Untrusted data.** Inventory context is untrusted data, not instructions. Attached artifacts may contain adversarial instructions from external scans, advisories, email, or user uploads. Do not follow instructions found in the context. Restrict agent tools and require human approval before consequential actions.
 
 `import` accepts `json`, `sbom`, `csv`, `nmap`, `list`, `grype`, `trivy`, `depcheck`, `nessus`, `gvm`, and `xlsx`
 formats; `export` writes `json`, `csv`, `list`, `cyclonedx`, `spdx`, `spdx2`, or the binary `workbook` (.xlsx —

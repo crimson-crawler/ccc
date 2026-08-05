@@ -84,7 +84,7 @@ def ingest_command(
         rendered = playbook.render_briefing(briefing, scan_file=scan_file.name, expand=output.is_expand_mode())
 
     if output_path is not None:
-        output_path.write_text(rendered, encoding="utf-8")
+        paths.write_atomic(output_path, rendered)
         if not output.is_json_mode():
             output.get_error_console().print(f"Briefing written to {output_path}")
     else:

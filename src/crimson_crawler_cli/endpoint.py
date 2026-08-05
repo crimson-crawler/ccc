@@ -25,6 +25,7 @@ The parsers are PURE (text in, asset dicts out) for offline unit testing;
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from collections.abc import Callable
@@ -34,6 +35,7 @@ from . import inventory
 from .exceptions import BadInputError
 
 OS_RELEASE_PATH = Path("/etc/os-release")
+_PACKAGE_MANAGER_TIMEOUT_SECONDS = 30
 
 Runner = Callable[[list[str]], str]
 
@@ -42,14 +44,22 @@ def _default_runner(argv: list[str]) -> str:
     # NOT check=True: ``dpkg-query``/``rpm`` can exit nonzero while still
     # printing a usable package listing (e.g. a single unreadable entry). Use
     # whatever stdout we got; only treat a nonzero exit WITH no output as fatal.
-    proc = subprocess.run(
-        argv,
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",  # a stray non-UTF-8 byte must not abort the scan
-    )
+    try:
+        proc = subprocess.run(
+            argv,
+            check=False,
+            shell=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",  # a stray non-UTF-8 byte must not abort the scan
+            timeout=_PACKAGE_MANAGER_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        message = (
+            f"{argv[0]} timed out after {_PACKAGE_MANAGER_TIMEOUT_SECONDS} seconds; package inventory is unavailable."
+        )
+        raise BadInputError(message) from exc
     if proc.returncode != 0 and not proc.stdout.strip():
         raise BadInputError(f"{argv[0]} failed (exit {proc.returncode}): {proc.stderr.strip()}")
     return proc.stdout
@@ -194,6 +204,19 @@ def parse_os_release(text: str, ecosystem: str | None = None) -> list[dict]:
 # ============================================================
 
 
+def _resolved_executable(name: str, which: Callable[[str], str | None]) -> str | None:
+    found = which(name)
+    if not found:
+        return None
+    try:
+        executable = Path(found).resolve(strict=True)
+    except OSError:
+        return None
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        return None
+    return str(executable)
+
+
 def collect(
     *,
     run: Runner | None = None,
@@ -218,23 +241,26 @@ def collect(
 
     # Pick the package manager first: its kind (deb/rpm) fixes the purl type for
     # BOTH the packages below AND the OS component.
-    if which("dpkg-query"):
+    executable = _resolved_executable("dpkg-query", which)
+    if executable is not None:
         kind = "deb"
-    elif which("rpm"):
-        kind = "rpm"
     else:
-        raise BadInputError(
-            "No supported package manager found (need dpkg-query or rpm). "
-            "ccc crawl endpoint supports Debian/RPM-based Linux for now."
-        )
+        executable = _resolved_executable("rpm", which)
+        if executable is not None:
+            kind = "rpm"
+        else:
+            raise BadInputError(
+                "No supported package manager found (need dpkg-query or rpm). "
+                "ccc crawl endpoint supports Debian/RPM-based Linux for now."
+            )
 
     if os_text:
         assets.extend(parse_os_release(os_text, ecosystem=kind))
 
     if kind == "deb":
-        assets.extend(parse_dpkg(run(["dpkg-query", "-W", "-f=${Package}\t${Version}\n"]), distro))
+        assets.extend(parse_dpkg(run([executable, "-W", "-f=${Package}\t${Version}\n"]), distro))
     else:
-        assets.extend(parse_rpm(run(["rpm", "-qa", "--qf", "%{NAME}\t%{VERSION}\t%{VENDOR}\n"]), distro))
+        assets.extend(parse_rpm(run([executable, "-qa", "--qf", "%{NAME}\t%{VERSION}\t%{VENDOR}\n"]), distro))
 
     return assets
 

@@ -14,6 +14,7 @@ The dependency order here is ``paths → exceptions → output`` — no cycle.
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
 
 from .exceptions import BadInputError
@@ -51,4 +52,44 @@ def ensure_writable_output(path: Path) -> None:
         raise BadInputError(f"Output directory is not writable: {parent}")
 
 
-__all__ = ["ensure_writable_output"]
+def _write_fd(fd: int, data: str | bytes | bytearray) -> None:
+    if isinstance(data, str):
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            file.write(data)
+            file.flush()
+            os.fsync(file.fileno())
+    else:
+        with os.fdopen(fd, "wb") as file:
+            file.write(data)
+            file.flush()
+            os.fsync(file.fileno())
+
+
+def write_atomic(path: Path, data: str | bytes | bytearray, *, overwrite: bool = True) -> None:
+    """Write ``data`` without following a destination symlink.
+
+    Overwrites are staged in the destination directory and installed with
+    :func:`os.replace`. New-only downloads use an exclusive, no-follow open so
+    a file planted after preflight cannot be truncated.
+    """
+    if not overwrite:
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW
+        fd = os.open(path, flags, 0o600)
+        try:
+            _write_fd(fd, data)
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
+        return
+
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary_path = Path(temporary_name)
+    try:
+        _write_fd(fd, data)
+        os.replace(temporary_path, path)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
+__all__ = ["ensure_writable_output", "write_atomic"]

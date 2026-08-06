@@ -218,7 +218,11 @@ def _count_with_top(items: Any, *, limit: int = 5) -> str:
     if not isinstance(items, list):
         return "0"
     count = len(items)
-    names = [it.get("name") for it in items if isinstance(it, dict) and it.get("name")]
+    # Escape here, not at the call sites. This helper composes a string that nine
+    # ``add_row`` callers render with markup enabled, and a composed return value
+    # is exactly what the semgrep taint rule cannot follow — so the escape has to
+    # live where the untrusted field is read, matching sibling ``_maybe``/``_trim``.
+    names = [escape(str(it.get("name"))) for it in items if isinstance(it, dict) and it.get("name")]
     if not names:
         return str(count)
     shown = _cap(names, limit)

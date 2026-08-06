@@ -16,6 +16,7 @@ from typing import Annotated, Any, Callable
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 
 _console = Console()
 _error_console = Console(stderr=True)
@@ -122,12 +123,22 @@ def render(payload: dict[str, Any], table_view: Callable[[Console, dict[str, Any
 
 
 def render_error(payload: dict[str, Any], human_message: str) -> None:
-    """Render an error in JSON mode or as a human-readable stderr message."""
+    """Render an error in JSON mode or as a human-readable stderr message.
+
+    ``human_message`` is server-derived on the primary path — ``exceptions.py``
+    passes ``str(APIError)`` (which carries the response body) and, on the
+    top-level safety net, ``f"internal error: {exc}"``. ``_error_console`` is a
+    bare :class:`Console`, so markup is interpreted: an unbalanced tag in a
+    server error body raised :class:`MarkupError` *inside the handler whose job
+    is producing a clean exit*, and style tags let the body forge output the CLI
+    never emitted. No call site passes intentional markup, so the whole message
+    is escaped and only the literal ``[red]`` prefix is left as markup.
+    """
     if _json_mode:
         sys.stderr.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
         sys.stderr.flush()
     else:
-        _error_console.print(f"[red]Error:[/red] {human_message}")
+        _error_console.print(f"[red]Error:[/red] {escape(human_message)}")
 
 
 __all__ = [

@@ -352,3 +352,64 @@ class TestGapC2AllSubcommands:
 
         assert result.exit_code == ExitCode.OK, result.output + result.stderr
         sdk_method.assert_awaited()
+
+
+MARKUP = "[red]x[/red]"
+
+
+class TestRichMarkupEscaping:
+    """Server- and user-derived strings must not be interpreted as Rich markup.
+
+    ``ccc reports`` renders report and template names straight into a markup-enabled
+    ``Console``, and a report name is *user*-writable (``ccc reports rename``). Left
+    unescaped, ``[link=…]`` becomes a real OSC-8 terminal hyperlink, style tags let a
+    name forge output the CLI never said, and a malformed tag raises ``MarkupError``,
+    turning a listing into "internal error"/exit 1.
+
+    The assertion in each case is that the payload appears **verbatim** in the output:
+    escaped markup renders back to its literal text, interpreted markup does not.
+    Payloads stay short so table column wrapping can't break the match.
+
+    Guarded in CI by ``crimson-crawler.rich-unescaped-untrusted-markup`` in
+    ``.gitlab/security/project-rules.yml``, whose path scope covers this whole command
+    package — these tests are what prove the rule's sanitizers are actually reached.
+    """
+
+    @pytest.mark.parametrize(
+        ("method", "return_value", "args"),
+        [
+            ("list_reports", [{"id": "r1", "name": MARKUP, "created_at": "2026-01-01"}], ["list"]),
+            ("discovery", {"tier": MARKUP}, ["discovery"]),
+            (
+                "generate_report",
+                {"report": {"id": "r1", "name": MARKUP}, "sections": [], "skipped": []},
+                ["generate", "exec"],
+            ),
+            ("rename_report", {"id": "r1", "name": MARKUP}, ["rename", "r1", MARKUP]),
+            ("section", {"text": "body", "unsupported_ids": [MARKUP]}, ["section", "-s", "s1"]),
+        ],
+        ids=["list", "discovery", "generate", "rename", "section-unsupported-ids"],
+    )
+    def test_markup_renders_verbatim(self, runner, authed, mock_sdk, method, return_value, args) -> None:
+        getattr(mock_sdk.ai_reports, method).return_value = return_value
+        result = runner.invoke(app, ["reports", *args])
+        assert result.exit_code == ExitCode.OK, result.output
+        assert MARKUP in result.output
+
+    def test_template_name_and_description_escaped(self, runner, authed, mock_sdk) -> None:
+        """Separate: asserts BOTH cells escaped, so the count matters, not just presence."""
+        mock_sdk.ai_reports.list_templates.return_value = [
+            {"id": "t1", "name": MARKUP, "description": MARKUP, "ai_sections": []},
+        ]
+        result = runner.invoke(app, ["reports", "templates"])
+        assert result.exit_code == ExitCode.OK, result.output
+        assert result.output.count(MARKUP) == 2
+
+    def test_malformed_markup_does_not_crash_the_listing(self, runner, authed, mock_sdk) -> None:
+        """An unbalanced closing tag would raise MarkupError -> exit 1 if interpreted."""
+        mock_sdk.ai_reports.list_reports.return_value = [
+            {"id": "r1", "name": "[/]", "created_at": "2026-01-01"},
+        ]
+        result = runner.invoke(app, ["reports", "list"])
+        assert result.exit_code == ExitCode.OK, result.output
+        assert "[/]" in result.output

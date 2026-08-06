@@ -19,6 +19,7 @@ from typing import Annotated, Any
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from .. import auth, output, paths
@@ -65,10 +66,10 @@ def _render_templates(console: Console, payload: dict[str, Any]) -> None:
     for t in templates:
         sections = t.get("ai_sections") or []
         table.add_row(
-            str(t.get("id", "")),
-            str(t.get("name", "")),
+            escape(str(t.get("id", ""))),
+            escape(str(t.get("name", ""))),
             str(len(sections)),
-            str(t.get("description", "")),
+            escape(str(t.get("description", ""))),
         )
     console.print(table)
 
@@ -89,7 +90,7 @@ def templates_command(_json: output.JsonFlag = False, _expand: output.ExpandFlag
 
 def _render_discovery(console: Console, payload: dict[str, Any]) -> None:
     for k, v in payload.items():
-        console.print(f"[bold]{k}:[/bold] {v}")
+        console.print(f"[bold]{escape(str(k))}:[/bold] {escape(str(v))}")
 
 
 @app.command("discovery", help="Show the Report Generator API discovery document + your account context.")
@@ -117,9 +118,9 @@ def _render_reports(console: Console, payload: dict[str, Any]) -> None:
     table.add_column("Created", overflow="fold")
     for r in reports:
         table.add_row(
-            str(r.get("id", "")),
-            str(r.get("name", "")),
-            str(r.get("created_at", r.get("createdAt", ""))),
+            escape(str(r.get("id", ""))),
+            escape(str(r.get("name", ""))),
+            escape(str(r.get("created_at", r.get("createdAt", "")))),
         )
     console.print(table)
 
@@ -186,7 +187,7 @@ def create_command(
     output.render(
         payload,
         lambda c, p: c.print(
-            f"[green]Draft created[/green] {p.get('id', '')} — "
+            f"[green]Draft created[/green] {escape(str(p.get('id', '')))} — "
             f"[dim]{len(p.get('ai_sections') or [])} AI section(s) to fill "
             f"(use `ccc reports generate` to do it in one shot)[/dim]"
         ),
@@ -219,10 +220,13 @@ def generate_command(
         report = p.get("report") or {}
         sections = p.get("sections") or []
         skipped = p.get("skipped") or []
-        console.print(f"[green]Report generated[/green] {report.get('id', '')} ([dim]{report.get('name', '')}[/dim])")
+        console.print(
+            f"[green]Report generated[/green] {escape(str(report.get('id', '')))} "
+            f"([dim]{escape(str(report.get('name', '')))}[/dim])"
+        )
         console.print(f"[dim]{len(sections)} AI section(s) filled[/dim]")
         if skipped:
-            joined = ", ".join(map(str, skipped))
+            joined = escape(", ".join(map(str, skipped)))
             console.print(f"[yellow]{len(skipped)} source id(s) skipped (unresolved): {joined}[/yellow]")
 
     output.render(payload, _render)
@@ -253,7 +257,7 @@ def fill_command(
     payload = with_status("Filling section…", _call())
 
     def _render(console: Console, p: dict[str, Any]) -> None:
-        section_type = p.get("section_type", "")
+        section_type = escape(str(p.get("section_type", "")))
         if p.get("complete"):
             console.print(f"[green]Filled section[/green] {section_type} — [dim]report complete[/dim]")
         else:
@@ -311,7 +315,7 @@ def section_command(
             console.print("[yellow]Section is not fully grounded in the provided sources.[/yellow]")
         unsupported = p.get("unsupported_ids") or []
         if unsupported:
-            joined = ", ".join(map(str, unsupported))
+            joined = escape(", ".join(map(str, unsupported)))
             console.print(f"[yellow]Unsupported source id(s): {joined}[/yellow]")
 
     output.render(payload, _render)
@@ -348,7 +352,7 @@ def export_command(
     payload = with_status("Exporting report…", _call())
     content = str(payload.get("content", ""))
     if output_path is not None:
-        output_path.write_text(content, encoding="utf-8")
+        paths.write_atomic(output_path, content)
         if output.is_json_mode():
             output.render({"filename": payload.get("filename"), "written": str(output_path)}, lambda c, p: None)
         else:
@@ -377,7 +381,10 @@ def rename_command(
 
     payload = with_status("Renaming report…", _call())
     output.render(
-        payload, lambda c, p: c.print(f"[green]Renamed[/green] report {p.get('id', report_id)} → {p.get('name', name)}")
+        payload,
+        lambda c, p: c.print(
+            f"[green]Renamed[/green] report {escape(str(p.get('id', report_id)))} → {escape(str(p.get('name', name)))}"
+        ),
     )
 
 
@@ -396,7 +403,7 @@ def delete_command(
             return {"deleted": await client.ai_reports.delete_report(report_id), "id": report_id}
 
     payload = with_status("Deleting report…", _call())
-    output.render(payload, lambda c, p: c.print(f"[green]Deleted[/green] report {p['id']}"))
+    output.render(payload, lambda c, p: c.print(f"[green]Deleted[/green] report {escape(str(p['id']))}"))
 
 
 __all__ = ["app"]

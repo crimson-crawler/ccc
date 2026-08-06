@@ -44,7 +44,7 @@ def _emit(doc: dict, output_path: Path | None) -> None:
         # but the confinement checks (symlink, directory, unwritable parent) apply
         # to every writer, and this one was skipping them entirely.
         paths.ensure_writable_output(output_path)
-        output_path.write_text(rendered, encoding="utf-8")
+        paths.write_atomic(output_path, rendered)
         output.get_error_console().print(f"Inventory written to {output_path}")
     else:
         sys.stdout.write(rendered)

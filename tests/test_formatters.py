@@ -150,6 +150,27 @@ def test_count_with_top_lists_all_names_under_expand() -> None:
     assert _formatters._count_with_top(items, limit=5) == "8 — G0, G1, G2, G3, G4, G5, G6, G7"
 
 
+def test_count_with_top_escapes_untrusted_names() -> None:
+    """The helper escapes, because its nine ``add_row`` callers cannot."""
+    assert _formatters._count_with_top([{"name": "[red]x[/red]"}]) == "1 — \\[red]x\\[/red]"
+    # Non-str names must not blow up the join either.
+    assert _formatters._count_with_top([{"name": 42}]) == "1 — 42"
+
+
+def test_render_technique_survives_malformed_markup_in_names() -> None:
+    """An unbalanced tag in a name would raise MarkupError → exit 1 if interpreted."""
+    text = _capture(
+        _formatters.render_technique,
+        {
+            "techniques": [{"technique_id": "T1055"}],
+            "groups": [{"name": "[/]"}],
+            "software": [{"name": "[link=file:///etc/passwd]innocent[/link]"}],
+        },
+    )
+    assert "[/]" in text
+    assert "[link=file:///etc/passwd]innocent[/link]" in text
+
+
 def test_render_cve_handles_missing_fields() -> None:
     """Empty payload (``cve: null``) emits the not-found line, no table."""
     text = _capture(_formatters.render_cve, {})

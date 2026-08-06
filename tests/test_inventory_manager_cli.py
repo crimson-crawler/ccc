@@ -751,3 +751,69 @@ class TestGapC1AllSubcommands:
 
         assert result.exit_code == ExitCode.OK, result.output + result.stderr
         sdk_method.assert_awaited()
+
+
+MARKUP = "[red]x[/red]"
+
+
+class TestRichMarkupEscaping:
+    """Server-derived strings must not be interpreted as Rich markup.
+
+    Two sites render untrusted *strings* (not counts) into a markup-enabled
+    ``Console``: ``apply-fix`` echoes the response's ``product``/``version``, and
+    ``import-multi`` echoes each source's ``label`` and its parse ``error``. Left
+    unescaped, style tags forge output the CLI never said and a malformed tag raises
+    ``MarkupError``, turning a successful import into "internal error"/exit 1.
+
+    Neither is reachable by ``crimson-crawler.rich-unescaped-untrusted-markup``:
+    ``product``/``version``/``error`` were absent from its field alternation, and
+    ``import-multi``'s read sits inside a generator expression inside ``"".join(...)``,
+    which taint mode does not follow. These tests are the guard — see the rule's note
+    in ``.gitlab/security/project-rules.yml``.
+    """
+
+    def test_apply_fix_escapes_product_and_version(self, runner, authed, mock_sdk) -> None:
+        """Both cells escaped, so the count matters — not just presence of one."""
+        mock_sdk.inventory_manager.apply_asset_fix.return_value = {
+            "product": MARKUP,
+            "version": MARKUP,
+            "item_count": 3,
+        }
+        result = runner.invoke(app, ["inventory-manager", "apply-fix", "p1", "nginx", "1.27.4"])
+        assert result.exit_code == ExitCode.OK, result.output
+        assert result.output.count(MARKUP) == 2
+
+    def test_apply_fix_malformed_markup_does_not_crash(self, runner, authed, mock_sdk) -> None:
+        mock_sdk.inventory_manager.apply_asset_fix.return_value = {
+            "product": "[/]",
+            "version": "1.27.4",
+            "item_count": 1,
+        }
+        result = runner.invoke(app, ["inventory-manager", "apply-fix", "p1", "nginx", "1.27.4"])
+        assert result.exit_code == ExitCode.OK, result.output
+        assert "[/]" in result.output
+
+    def test_import_multi_escapes_source_label_and_error(self, runner, authed, mock_sdk, tmp_path: Path) -> None:
+        source = tmp_path / "assets.csv"
+        source.write_text("product,version\nnginx,1.27.0\n", encoding="utf-8")
+        mock_sdk.inventory_manager.import_multi.return_value = {
+            "id": "p1",
+            "item_count": 1,
+            "per_source": [{"label": MARKUP, "contributed": 1, "error": MARKUP}],
+        }
+        result = runner.invoke(app, ["inventory-manager", "import-multi", "-s", str(source)])
+        assert result.exit_code == ExitCode.OK, result.output
+        assert result.output.count(MARKUP) == 2
+
+    def test_import_multi_malformed_source_error_does_not_crash(self, runner, authed, mock_sdk, tmp_path: Path) -> None:
+        """A server parse error is the most injection-prone value on this path."""
+        source = tmp_path / "assets.csv"
+        source.write_text("product,version\nnginx,1.27.0\n", encoding="utf-8")
+        mock_sdk.inventory_manager.import_multi.return_value = {
+            "id": "p1",
+            "item_count": 0,
+            "per_source": [{"label": "assets.csv", "contributed": 0, "error": "[/]"}],
+        }
+        result = runner.invoke(app, ["inventory-manager", "import-multi", "-s", str(source)])
+        assert result.exit_code == ExitCode.OK, result.output
+        assert "[/]" in result.output

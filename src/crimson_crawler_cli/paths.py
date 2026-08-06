@@ -1,9 +1,13 @@
-"""Pre-flight validation for ``--output`` destinations.
+"""Validated, symlink-safe writes for ``--output`` destinations.
 
-Commands that write their result to a file (``ingest nmap``, ``workspace get``,
-``workspace export``) call :func:`ensure_writable_output` *before* any network
-work so a bad path fails fast — exit 64 with a clean message — instead of
-wasting API usage and then raising a raw :class:`OSError` at the final write.
+Every command that writes its result to a file uses both halves of this module:
+
+* :func:`ensure_writable_output` runs *before* any network work, so a bad path
+  fails fast (exit 64 with a clean message) instead of wasting API usage and
+  then raising a raw :class:`OSError` at the final write.
+* :func:`write_atomic` performs the write itself. The pre-flight is only a
+  pre-flight; a destination that passes it and is replaced by a symlink before
+  the write is a real window, so the write must not be able to follow a link.
 
 This lives in its own module (not ``output.py``) on purpose: ``exceptions.py``
 already does ``from . import output``, so a helper that raises
@@ -36,6 +40,8 @@ def ensure_writable_output(path: Path) -> None:
     world-writable directory. Refuse the link and make the caller name a real
     file; the target being writable is not the same as the caller intending to
     write there.
+
+    Not sufficient on its own — see :func:`write_atomic` for the write-side half.
     """
     if path.is_symlink():
         raise BadInputError(
@@ -69,8 +75,14 @@ def write_atomic(path: Path, data: str | bytes | bytearray, *, overwrite: bool =
     """Write ``data`` without following a destination symlink.
 
     Overwrites are staged in the destination directory and installed with
-    :func:`os.replace`. New-only downloads use an exclusive, no-follow open so
-    a file planted after preflight cannot be truncated.
+    :func:`os.replace`, which replaces the link *itself* rather than writing
+    through it. New-only downloads use an exclusive, no-follow open so a file
+    planted after the pre-flight cannot be truncated.
+
+    Note the installed file is mode ``0600``, not umask-derived, and overwriting
+    discards the previous file's mode — the staged temporary's permissions are
+    what survive the rename. If a later reader needs group access, widen it
+    deliberately at the call site.
     """
     if not overwrite:
         flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW

@@ -374,7 +374,8 @@ def apply_fix_command(
     output.render(
         payload,
         lambda c, p: c.print(
-            f"[green]Applied[/green] {p.get('product', product)} → {p.get('version', version)} "
+            f"[green]Applied[/green] {escape(str(p.get('product', product)))} → "
+            f"{escape(str(p.get('version', version)))} "
             f"(inventory now has {p.get('item_count', '?')} assets)."
         ),
     )
@@ -716,8 +717,8 @@ def import_multi_command(
             + (f" [dim](mode: {p['mode']})[/dim]" if p.get("mode") else "")
             + (f" [yellow](+{p['truncated']} dropped — 200 cap)[/yellow]" if p.get("truncated") else "")
             + "".join(
-                f"\n  [dim]· {s.get('label', '?')}: +{s.get('contributed', 0)} new"
-                + (f" — {s['error']}" if s.get("error") else "")
+                f"\n  [dim]· {escape(str(s.get('label', '?')))}: +{s.get('contributed', 0)} new"
+                + (f" — {escape(str(s['error']))}" if s.get("error") else "")
                 + "[/dim]"
                 for s in (p.get("per_source") or [])
             )

@@ -54,8 +54,39 @@ def test_missing_everywhere_raises(clean_env: Path) -> None:
 def test_config_file_without_api_key_field_raises(secure_config_file: Path) -> None:
     secure_config_file.write_text("other_field = 42\n", encoding="utf-8")
 
-    with pytest.raises(MissingCredentialsError):
+    with pytest.raises(MissingCredentialsError) as exc_info:
         auth.resolve_auth()
+
+    message = str(exc_info.value)
+    assert str(secure_config_file) in message
+    assert config.EXPECTED_SHAPE in message
+
+
+def test_config_file_with_env_var_name_as_field_says_so(secure_config_file: Path) -> None:
+    """Valid TOML, wrong field — the quiet twin of the malformed-file case.
+
+    ``CRIMSON_CRAWLER_API_KEY = "…"`` parses perfectly and resolves to nothing,
+    so the generic "no API key found" is actively misleading here. Stays exit 2
+    (nothing is broken, the key simply isn't there).
+    """
+    secure_config_file.write_text('CRIMSON_CRAWLER_API_KEY = "abc123"\n', encoding="utf-8")
+
+    with pytest.raises(MissingCredentialsError) as exc_info:
+        auth.resolve_auth()
+
+    message = str(exc_info.value)
+    assert "the environment-variable name" in message
+    assert "`api_key`" in message
+    assert "abc123" not in message
+
+
+def test_credential_origin_reports_the_active_source(monkeypatch: pytest.MonkeyPatch, secure_config_file: Path) -> None:
+    """Feeds the 401 message; env wins over config, same as resolution."""
+    secure_config_file.write_text('api_key = "cfg"\n', encoding="utf-8")
+    assert auth.credential_origin() == str(secure_config_file)
+
+    monkeypatch.setenv("CRIMSON_CRAWLER_API_KEY", "env")
+    assert auth.credential_origin() == "the CRIMSON_CRAWLER_API_KEY environment variable"
 
 
 @pytest.mark.skipif(config.os.name != "posix", reason="POSIX ownership and mode checks")

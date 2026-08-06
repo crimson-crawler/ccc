@@ -79,6 +79,7 @@ def _render_artifact_enrich(console: Any, payload: dict[str, Any]) -> None:
     # Action breakdown — the engine tags each reference with a recommended action.
     actions = _count_actions(references)
     if actions:
+        # No escaping: _count_actions keys are always one of its four literals.
         breakdown = " · ".join(f"{label} {count}" for label, count in actions.items())
         table.add_row("Actions", breakdown)
 
@@ -171,7 +172,7 @@ def artifact_enrich_command(
     payload = _formatters.with_live_progress("Enriching", _call)
 
     if output_path is not None:
-        output_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        paths.write_atomic(output_path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
         if not output.is_json_mode():
             output.get_error_console().print(f"Report written to {output_path}")
         return

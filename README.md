@@ -68,6 +68,10 @@ Two sources, checked in this order:
    api_key = "your-api-key"
    ```
 
+   It is TOML, not a shell file — the field is `api_key` (lowercase, quoted value), *not* the
+   `CRIMSON_CRAWLER_API_KEY=…` form you would `export`. A file in the shell shape is reported as such
+   and exits `64`, not read as a key.
+
    On POSIX systems, the file must be owned by your user and inaccessible to group and other users:
 
    ```bash
@@ -431,7 +435,7 @@ Both emit a CycloneDX 1.6 document:
   "specVersion": "1.6",
   "version": 1,
   "metadata": { "timestamp": "2026-06-26T14:03:00Z",
-                "tools": [{ "name": "ccc crawl", "version": "4.1.1" }] },
+                "tools": [{ "name": "ccc crawl", "version": "4.1.2" }] },
   "components": [
     { "type": "operating-system", "name": "ubuntu", "version": "24.04",
       "group": "ubuntu", "purl": "pkg:deb/ubuntu/ubuntu@24.04" },
@@ -630,7 +634,7 @@ What the CLI deliberately does *not* have is a generic raw-JSON passthrough (`cc
 | `1` | Internal CLI error (caught as a safety net — should never fire in normal use). |
 | `2` | No API key in env or config. Nothing else exits `2`. |
 | `3` | API rejected the request — auth, validation, or server error. `--json` carries `status` + the decoded `body`. |
-| `64` | Malformed input (CVE id, CWE id, technique id, empty keyword, unknown `ingest`/`import` format, empty artifact-enrich input), an unwritable or symlinked `--output` path, **or** a command-line usage error — unknown option, missing required argument, a value outside an allowed range. |
+| `64` | Malformed input (CVE id, CWE id, technique id, empty keyword, unknown `ingest`/`import` format, empty artifact-enrich input), an unwritable or symlinked `--output` path, an unreadable or non-TOML `~/.crimson-crawler/config.toml`, **or** a command-line usage error — unknown option, missing required argument, a value outside an allowed range. |
 
 Non-zero codes are stable; CI and shell scripts can branch on them.
 
@@ -640,6 +644,18 @@ prompt_for_key; fi` fired on an ordinary typo. The usage family is remapped to `
 other bad-input case, so `2` means only what it says. And `--output` refuses a path that is a symlink
 rather than writing through it: `write_text` follows the link and truncates its target, which silently
 replaced an unrelated file. Pass the real destination.
+
+A broken config file is `64` for the same reason: the key is present but misformatted, so prompting for
+a new one is the wrong move. The message names the file, the mistake, and the fix — the two common
+shapes (`CRIMSON_CRAWLER_API_KEY=…` shell syntax, or an unquoted `api_key` value) are called out by
+name. Key *values* are never echoed back.
+
+### Rejected keys
+
+`401` and `403` say so in those terms and name where the key came from — the env var or the config
+file path — rather than reporting a bare status. A `401` is nearly always a revoked key, or a key used
+against a different deployment than the one that issued it: `CRIMSON_CRAWLER_BASE_URL` and the key have
+to agree. `ccc whoami` shows which source the CLI is actually reading.
 
 ## Retry & rate limits
 

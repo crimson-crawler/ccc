@@ -486,3 +486,33 @@ class TestRating:
         result = runner.invoke(app, ["artifact-manager", "rating", "s1", "--set", "clear"])
         assert result.exit_code == ExitCode.OK
         mock_sdk.artifact_manager.set_rating.assert_awaited_once_with("s1", None)
+
+
+MARKUP = "[red]x[/red]"
+
+
+class TestRichMarkupEscaping:
+    """``rating`` renders a server-supplied scalar into a markup-enabled ``Console``.
+
+    ``_render_rating`` interpolates ``payload['rating']`` directly, so an unescaped
+    value forges styled output and a malformed tag raises ``MarkupError`` inside a
+    command that should have exited 0.
+
+    The CI rule ``crimson-crawler.rich-unescaped-untrusted-markup`` covers this file's
+    path, but ``rating`` is not in its field-name alternation, so these tests are the
+    only guard on this site — see the rule's own note in
+    ``.gitlab/security/project-rules.yml``.
+    """
+
+    def test_rating_renders_verbatim(self, runner, authed, mock_sdk) -> None:
+        mock_sdk.artifact_manager.get_rating.return_value = {"rating": MARKUP, "counts": {"up": 1, "down": 0}}
+        result = runner.invoke(app, ["artifact-manager", "rating", "s1"])
+        assert result.exit_code == ExitCode.OK, result.output
+        assert MARKUP in result.output
+
+    def test_malformed_rating_does_not_crash(self, runner, authed, mock_sdk) -> None:
+        """An unbalanced closing tag would raise MarkupError -> exit 1 if interpreted."""
+        mock_sdk.artifact_manager.get_rating.return_value = {"rating": "[/]", "counts": {}}
+        result = runner.invoke(app, ["artifact-manager", "rating", "s1"])
+        assert result.exit_code == ExitCode.OK, result.output
+        assert "[/]" in result.output

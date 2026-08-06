@@ -616,7 +616,10 @@ def update_command(
             return {"artifact": await client.artifact_manager.update_artifact(artifact_id, **kwargs)}
 
     payload = with_status("Updating artifact…", _call())
-    output.render(payload, lambda c, p: c.print(f"[green]Updated[/green] {p['artifact'].get('name') or artifact_id}"))
+    output.render(
+        payload,
+        lambda c, p: c.print(f"[green]Updated[/green] {escape(str(p['artifact'].get('name') or artifact_id))}"),
+    )
 
 
 # -- copy ------------------------------------------------------------------- #
@@ -712,7 +715,7 @@ class RatingValue(str, Enum):
 def _render_rating(console: Console, payload: dict[str, Any]) -> None:
     counts = payload.get("counts", {})
     console.print(
-        f"Your rating: [bold]{payload.get('rating') or '—'}[/bold]  "
+        f"Your rating: [bold]{escape(str(payload.get('rating') or '—'))}[/bold]  "
         f"([green]↑{counts.get('up', 0)}[/green] [red]↓{counts.get('down', 0)}[/red])"
     )
 

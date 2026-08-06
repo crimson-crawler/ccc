@@ -91,6 +91,70 @@ class BadInputError(CLIError):
     exit_code: ExitCode = ExitCode.BAD_INPUT
 
 
+class ConfigFileError(CLIError):
+    """Raised when ``~/.crimson-crawler/config.toml`` exists but is unusable.
+
+    Local validation of a file the user wrote, so it lands on
+    :attr:`ExitCode.BAD_INPUT` alongside every other bad-input case — not on
+    :attr:`ExitCode.MISSING_CREDENTIALS`, which means *only* "no API key
+    anywhere" and which CI wrappers branch on to prompt for a key.
+
+    Without this class a malformed config surfaced through ``handle_errors``'
+    top-level safety net as ``internal error: Invalid value at line 1 column
+    25`` — a tomllib parse position with no mention of the file it came from,
+    let alone the one-line fix.
+    """
+
+    exit_code: ExitCode = ExitCode.BAD_INPUT
+
+
+class ConfigPermissionError(ConfigFileError, PermissionError):
+    """Raised when the config file's ownership or mode is unsafe to read.
+
+    Also a :class:`PermissionError` because that is what callers (and the
+    existing tests) catch for the ownership/``chmod 600`` refusals, which
+    predate the :class:`ConfigFileError` family.
+    """
+
+
+def describe_api_status(status: int) -> str:
+    """Human-readable one-liner for an API status code.
+
+    ``401``/``403`` get a credential-specific message naming where the key the
+    CLI just used came from, because "returned status 401" alone reads like a
+    server problem when it is almost always a stale, revoked, or wrong-origin
+    key. Every other status keeps the neutral phrasing — the response body,
+    which the JSON payload carries in full, is the better detail there.
+    """
+    if status == 401:
+        return (
+            "The Crimson Crawler API rejected your API key (HTTP 401)."
+            f"{_key_origin_sentence()} Confirm the key is still active at "
+            "https://crimsoncrawler.com/dashboard, and that CRIMSON_CRAWLER_BASE_URL "
+            "points at the deployment that issued it — a key is only valid on its own origin. "
+            "Run `ccc whoami` to see which key the CLI is picking up."
+        )
+    if status == 403:
+        return (
+            "The Crimson Crawler API accepted your key but refused this request (HTTP 403)."
+            f"{_key_origin_sentence()} The key may lack access to this endpoint, "
+            "or your plan may not include it."
+        )
+    return f"Crimson Crawler API returned status {status}"
+
+
+def _key_origin_sentence() -> str:
+    """`` The key came from …`` — or an empty string when it can't be determined.
+
+    Imported lazily: :mod:`auth` imports this module at load time, so a
+    module-level import here would be circular.
+    """
+    from . import auth  # noqa: PLC0415 — deliberate, see docstring
+
+    origin = auth.credential_origin()
+    return f" The key came from {origin}." if origin else ""
+
+
 class APIError(CLIError):
     """Raised when the API returns a non-success status.
 
@@ -104,7 +168,7 @@ class APIError(CLIError):
     def __init__(self, status: int, body: dict[str, Any] | str | None, message: str | None = None) -> None:
         self.status = status
         self.body = body
-        super().__init__(message or f"Crimson Crawler API returned status {status}")
+        super().__init__(message or describe_api_status(status))
 
 
 def _decode_unexpected_body(raw: Any) -> dict[str, Any] | str | None:
@@ -149,7 +213,7 @@ def handle_errors(func: Callable[..., Any]) -> Callable[..., Any]:
             return func(*args, **kwargs)
         except UnexpectedStatus as exc:
             body = _decode_unexpected_body(exc.body)
-            api_error = APIError(exc.status, body, f"Crimson Crawler API returned status {exc.status}")
+            api_error = APIError(exc.status, body)
             payload: dict[str, Any] = {
                 "error": "APIError",
                 "message": str(api_error),
@@ -181,7 +245,10 @@ __all__ = [
     "APIError",
     "BadInputError",
     "CLIError",
+    "ConfigFileError",
+    "ConfigPermissionError",
     "ExitCode",
     "MissingCredentialsError",
+    "describe_api_status",
     "handle_errors",
 ]

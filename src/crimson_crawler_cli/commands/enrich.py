@@ -611,7 +611,7 @@ def batch_command(
 
     payload = _formatters.with_status(f"Enriching {len(body)} items…", _call())
     if output_path is not None:
-        output_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        paths.write_atomic(output_path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
         if not output.is_json_mode():
             output.get_error_console().print(f"Batch result written to {output_path}")
         return

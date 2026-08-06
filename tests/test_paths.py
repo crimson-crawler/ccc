@@ -128,3 +128,29 @@ def test_new_only_write_uses_restrictive_permissions(tmp_path: Path) -> None:
     destination = tmp_path / "export.zip"
     write_atomic(destination, b"payload", overwrite=False)
     assert destination.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("target_exists", [True, False], ids=["link-to-file", "dangling-link"])
+def test_new_only_write_refuses_a_planted_symlink(tmp_path: Path, target_exists: bool) -> None:
+    """``O_CREAT|O_EXCL|O_NOFOLLOW`` is the write-side guard for new-only downloads.
+
+    The dangling case is the one that matters: callers gate on ``Path.exists()``,
+    which is False through a broken link, so only this flag combination stops the
+    write from creating the link's target. The link itself must also survive — a
+    failed ``os.open`` happens before ``write_atomic``'s cleanup block, so nothing
+    unlinks an attacker-supplied path on our behalf.
+    """
+    victim = tmp_path / "victim.txt"
+    if target_exists:
+        victim.write_text("unchanged", encoding="utf-8")
+    destination = tmp_path / "export.zip"
+    destination.symlink_to(victim)
+
+    with pytest.raises(FileExistsError):
+        write_atomic(destination, b"payload", overwrite=False)
+
+    assert destination.is_symlink()
+    if target_exists:
+        assert victim.read_text(encoding="utf-8") == "unchanged"
+    else:
+        assert not victim.exists()

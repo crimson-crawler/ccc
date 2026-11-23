@@ -19,11 +19,14 @@ from rich.table import Table
 from .. import auth, output, paths
 from ..client_factory import build_client
 from ..exceptions import BadInputError, handle_errors
-from ._formatters import with_live_progress, with_status
+from ..tlp import tlp_option, tlp_value
+from ._formatters import render_vulnerability_detail, with_live_progress, with_status
 
 # Asset import/export formats — the user PICKS one (no auto-detect), mirroring the portal editor.
-_IMPORT_FORMATS = ("json", "sbom", "csv", "nmap", "list", "grype", "trivy", "depcheck", "nessus", "gvm", "xlsx")
-_EXPORT_FORMATS = ("json", "csv", "list", "cyclonedx", "spdx", "spdx2", "workbook")
+# `vex` is the VEX suppression-overlay import (OpenVEX 0.2.0 / CSAF 2.0) — it attaches an overlay to
+# an inventory (create or inventory_id edit), it does NOT import assets (#324).
+_IMPORT_FORMATS = ("json", "sbom", "csv", "nmap", "list", "grype", "trivy", "depcheck", "nessus", "gvm", "xlsx", "vex")
+_EXPORT_FORMATS = ("json", "csv", "list", "cyclonedx", "spdx", "spdx2", "workbook", "all")
 
 app = typer.Typer(
     name="inventory-manager",
@@ -44,6 +47,7 @@ def _render_inventories(console: Console, payload: dict[str, Any]) -> None:
     table = Table(title=f"Inventories ({len(inventories)})")
     table.add_column("ID", overflow="fold")
     table.add_column("Name", overflow="fold")
+    table.add_column("TLP")
     table.add_column("Assets", justify="right")
     table.add_column("Attached", justify="right")
     table.add_column("Monitor", justify="center")
@@ -51,6 +55,7 @@ def _render_inventories(console: Console, payload: dict[str, Any]) -> None:
         table.add_row(
             escape(str(p.get("id", ""))),
             escape(str(p.get("name", ""))),
+            escape(str(p.get("tlp", ""))),
             escape(str(p.get("item_count", 0))),
             escape(str(p.get("linked_count", 0))),
             "●" if p.get("monitoring") else "",
@@ -76,12 +81,40 @@ def _render_inventory(console: Console, payload: dict[str, Any]) -> None:
     console.print(f"[bold]{escape(str(payload.get('inventory_name') or payload.get('name', '')))}[/bold]")
     if payload.get("description"):
         console.print(escape(str(payload["description"])))
+    tlp = payload.get("tlp")
     console.print(
         f"[dim]Monitoring {'on' if payload.get('monitoring') else 'off'} · "
-        f"{len(payload.get('inventory', []))} assets · "
+        + (f"TLP {escape(str(tlp))} · " if tlp else "")
+        + f"{len(payload.get('inventory', []))} assets · "
         f"{len(payload.get('attached', []))} attached · "
         f"{len(payload.get('enrichments', []))} saved enrichments[/dim]"
     )
+    posture = payload.get("posture") if isinstance(payload.get("posture"), dict) else None
+    # OT context the caller declared (never inferred) — a compact line so `ccc … show` makes it visible
+    # without dumping every asset; `--json` carries the full per-asset fields.
+    items = payload.get("inventory") if isinstance(payload.get("inventory"), list) else []
+    ot_items = [it for it in items if isinstance(it, dict) and it.get("asset_class")]
+    if ot_items:
+        safety = sum(1 for it in ot_items if it.get("safety_critical") is True)
+        classes = sorted({escape(str(it.get("asset_class"))) for it in ot_items})
+        console.print(
+            f"[dim]OT profile: {len(ot_items)} classified asset{'' if len(ot_items) == 1 else 's'} "
+            f"({', '.join(classes)})" + (f" · {safety} safety-critical" if safety else "") + "[/dim]"
+        )
+    if posture:
+        parts = [
+            (posture.get("total_cves"), "open CVEs"),
+            (posture.get("total_kev"), "KEV"),
+            (posture.get("overdue_kev"), "KEV overdue"),
+            (posture.get("due_soon_kev"), "KEV due within 14 days"),
+            (posture.get("weaponized"), "with a Metasploit module"),
+            (posture.get("forensic_triage"), "need forensic review"),
+            (posture.get("upgrades_ready"), "upgrades ready"),
+        ]
+        line = " · ".join(f"{n} {label}" for n, label in parts if isinstance(n, int) and (n or label == "open CVEs"))
+        if isinstance(posture.get("max_weaponization"), (int, float)):
+            line += f" · peak weaponization {posture['max_weaponization']:.0f}/100"
+        console.print(f"Risk posture: {escape(line)}")
 
 
 @app.command(
@@ -166,6 +199,80 @@ def enrichments_command(
     output.render(payload, _render_enrichments)
 
 
+# -- history ---------------------------------------------------------------- #
+
+
+def _render_history(console: Console, payload: dict[str, Any]) -> None:
+    items = payload.get("items", [])
+    if not items:
+        console.print("[dim]No history.[/dim]")
+        return
+    table = Table(title=f"History ({len(items)})")
+    table.add_column("When", no_wrap=True)
+    table.add_column("Type", no_wrap=True)
+    table.add_column("Summary", overflow="fold")
+    table.add_column("Actor · surface", overflow="fold")
+    table.add_column("Ref", min_width=16, overflow="fold")
+    for item in items:
+        ref = item.get("ref") if isinstance(item.get("ref"), dict) else None
+        ref_name = ""
+        if ref:
+            ref_name = str(ref.get("name", "")) + (" (deleted)" if ref.get("deleted") else "")
+        table.add_row(
+            escape(str(item.get("at", ""))[:16].replace("T", " ")),
+            escape(str(item.get("type", ""))),
+            escape(str(item.get("summary", ""))),
+            escape(f"{item.get('actor', '')} · {item.get('surface', '')}"),
+            escape(ref_name),
+        )
+    console.print(table)
+    if payload.get("next_cursor"):
+        console.print("[dim]More history on the next page: rerun with --all to fetch every page.[/dim]")
+
+
+@app.command("history", help="An inventory's change history, newest first.")
+@handle_errors
+def history_command(
+    inventory_id: Annotated[str, typer.Argument(help="Inventory (asset) id.", show_default=False)],
+    types: Annotated[
+        list[str] | None,
+        typer.Option("--type", help="Event type to keep, repeatable (e.g. assets_changed).", show_default=False),
+    ] = None,
+    search: Annotated[str | None, typer.Option("--search", help="Search text matched against each summary.")] = None,
+    since: Annotated[str | None, typer.Option("--since", help="ISO date lower bound.")] = None,
+    until: Annotated[str | None, typer.Option("--until", help="ISO date upper bound.")] = None,
+    actor: Annotated[str | None, typer.Option("--actor", help="Who acted: you, 'daily monitor' or api.")] = None,
+    limit: Annotated[
+        int | None, typer.Option("--limit", min=1, max=200, help="Page size, 1-200 (server default 50).")
+    ] = None,
+    all_pages: Annotated[bool, typer.Option("--all", help="Follow cursors and return every page.")] = False,
+    _json: output.JsonFlag = False,
+    _expand: output.ExpandFlag = False,
+) -> None:
+    """List an inventory's change history via ``client.inventory_manager.get_history`` (one page), or every
+    page via ``iter_history`` with ``--all``. Filters: ``--type`` (repeatable), ``--search``, ``--since``,
+    ``--until``, ``--actor``, ``--limit``."""
+    resolved = auth.resolve_auth()
+    filters: dict[str, Any] = {
+        "types": types,
+        "q": search,
+        "since": since,
+        "until": until,
+        "actor": actor,
+        "limit": limit,
+    }
+
+    async def _call() -> dict[str, Any]:
+        async with build_client(resolved) as client:
+            if not all_pages:
+                return await client.inventory_manager.get_history(inventory_id, **filters)
+            items = [item async for item in client.inventory_manager.iter_history(inventory_id, **filters)]
+            return {"items": items, "next_cursor": None}
+
+    payload = with_status("Loading history…", _call())
+    output.render(payload, _render_history)
+
+
 # -- compare ---------------------------------------------------------------- #
 
 
@@ -195,7 +302,7 @@ def _render_inventory_matrix(console: Console, payload: dict[str, Any]) -> None:
                 cells.append("—")
             else:
                 weap = c.get("weaponization", "·")
-                cells.append(f"{weap}{' KEV' if c.get('kev') else ''}")
+                cells.append(f"{weap}{' KEV' if c.get('kev') else ''}{' MSF' if c.get('weaponized') else ''}")
         table.add_row(escape(str(row.get("cve_id", ""))), escape(str(row.get("status", ""))), *map(escape, cells))
     console.print(table)
 
@@ -224,7 +331,10 @@ def compare_command(
 # -- write (create / delete / attach / detach / monitor / enrichment) ---- #
 
 
-@app.command("create", help="Create an empty Inventory Manager inventory (add assets later via attach).")
+@app.command(
+    "create",
+    help="Create an empty Inventory Manager inventory (add assets later with `import --into`).",
+)
 @handle_errors
 def create_command(
     name: Annotated[
@@ -254,12 +364,7 @@ def create_command(
             )
 
     payload = with_status("Creating inventory…", _call())
-    output.render(
-        payload,
-        lambda c, p: c.print(
-            f"[green]Created[/green] inventory {p.get('id', '')} ([dim]{p.get('item_count', 0)} assets[/dim])"
-        ),
-    )
+    output.render(payload, _render_created)
 
 
 @app.command("delete", help="Delete one of your Inventory Manager inventories.")
@@ -278,6 +383,22 @@ def delete_command(
     output.render(payload, lambda c, p: c.print(f"[green]Deleted[/green] inventory {p['id']}"))
 
 
+def _render_tlp_remark(console: Console, payload: dict[str, Any]) -> None:
+    """Report the inventory's own TLP carried onto the artifacts this call newly attached (#374 follow-up):
+    an attached artifact takes the inventory's marking, so the door says when it moved one."""
+    ids = payload.get("attachment_tlp_ids")
+    tlp = payload.get("attachment_tlp")
+    if tlp and isinstance(ids, list) and ids:
+        console.print(f"[dim]Marked {len(ids)} artifact(s) TLP:{tlp} to match the inventory.[/dim]")
+
+
+def _render_created(console: Console, payload: dict[str, Any]) -> None:
+    console.print(
+        f"[green]Created[/green] inventory {payload.get('id', '')} ([dim]{payload.get('item_count', 0)} assets[/dim])"
+    )
+    _render_tlp_remark(console, payload)
+
+
 def _render_attach(console: Console, payload: dict[str, Any]) -> None:
     # Bulk shape: {id, linked_count, attached, skipped, mode}.
     if "attached" in payload:
@@ -288,14 +409,14 @@ def _render_attach(console: Console, payload: dict[str, Any]) -> None:
             f"{payload.get('linked_count', 0)} attached"
             + (f" [yellow]({skipped} skipped — not attachable)[/yellow]" if skipped else "")
         )
-        return
     # Single shape: {ok, linked, already}.
-    if not payload.get("ok"):
+    elif not payload.get("ok"):
         console.print("[yellow]Not linked.[/yellow]")
     elif payload.get("already"):
         console.print("[dim]Already linked — no change.[/dim]")
     else:
         console.print("[green]Linked[/green] artifact to inventory.")
+    _render_tlp_remark(console, payload)
 
 
 @app.command("attach", help="Attach saved artifact(s) to an inventory (one or many; idempotent).")
@@ -349,7 +470,10 @@ def detach_command(
     )
 
 
-@app.command("apply-fix", help="Apply a recommended upgrade to one asset (sets its version; preserves the rest).")
+@app.command(
+    "apply-fix",
+    help="Apply a recommended upgrade to every asset with that product (sets their version; preserves the rest).",
+)
 @handle_errors
 def apply_fix_command(
     inventory_id: Annotated[str, typer.Argument(help="Inventory (asset) id.", show_default=False)],
@@ -360,15 +484,25 @@ def apply_fix_command(
     vendor: Annotated[
         str | None, typer.Option("--vendor", help="Disambiguate duplicate product names.", show_default=False)
     ] = None,
+    group: Annotated[
+        str | None,
+        typer.Option(
+            "--group",
+            help="Scope the fix to one host/asset group (the asset's own `group`; imports set it per host).",
+            show_default=False,
+        ),
+    ] = None,
 ) -> None:
-    """Apply a recommended upgrade via ``client.inventory_manager.apply_asset_fix`` — sets the matched
-    asset's version to the published fix the Inventory Enricher surfaced, preserving everything else. Writes
-    the inventory only (no re-enrich; the next enrichment / daily monitor confirms the CVEs cleared)."""
+    """Apply a recommended upgrade via ``client.inventory_manager.apply_asset_fix`` — sets EVERY asset
+    matching that product (case-insensitive; ``--vendor`` narrows further, ``--group`` scopes the fix to
+    a single host/asset group) to the published fix the Inventory Enricher surfaced, preserving
+    everything else. Writes the inventory only (no re-enrich; the next enrichment / daily monitor
+    confirms the CVEs cleared)."""
     resolved = auth.resolve_auth()
 
     async def _call() -> dict[str, Any]:
         async with build_client(resolved) as client:
-            return await client.inventory_manager.apply_asset_fix(inventory_id, product, version, vendor)
+            return await client.inventory_manager.apply_asset_fix(inventory_id, product, version, vendor, group)
 
     payload = with_status("Applying upgrade…", _call())
     output.render(
@@ -516,6 +650,56 @@ def _render_inventory_scan(console: Console, payload: dict[str, Any]) -> None:
         )
     else:
         console.print("[green]Enrichment complete.[/green]")
+    # #348 — assets whose identity never resolved (match none/cpe_fuzzy): the rollup counter when the
+    # engine provides it, else the per-asset match kinds (older artifacts predate the field). A nonzero
+    # count gets a compact "product@version — detail" list so "0 CVEs" is never mistaken for "clean".
+    raw_unmatched = summary.get("unmatched_assets")
+    asset_rows = report.get("assets") if isinstance(report.get("assets"), list) else []
+    unmatched: int
+    if raw_unmatched is None:
+        unmatched = len(
+            [
+                a
+                for a in asset_rows
+                if isinstance(a, dict) and a.get("status") != "error" and a.get("match") in ("none", "cpe_fuzzy")
+            ]
+        )
+    else:
+        unmatched = int(raw_unmatched) if isinstance(raw_unmatched, (int, float)) else 0
+    if unmatched > 0:
+        console.print(f"[yellow]Unverified assets:[/yellow] {unmatched} — no CPE/OSV identity resolved")
+        for a in asset_rows:
+            if not isinstance(a, dict) or a.get("status") == "error":
+                continue
+            if a.get("match") not in ("none", "cpe_fuzzy"):
+                continue
+            name = a.get("product") or a.get("name") or "—"
+            vers = a.get("versions") or []
+            label = f"{name}@{vers[0]}" if vers and str(vers[0]) else name
+            detail = a.get("match_detail")
+            if detail:
+                console.print(f"  [dim]{escape(str(label))} — {escape(str(detail))}[/dim]")
+            else:
+                console.print(f"  [dim]{escape(str(label))}[/dim]")
+    # Report schema 2.2 — the CVEs with exploit evidence, and the logs that observe the most linked techniques.
+    seen: set[str] = set()
+    evidence: list[dict[str, Any]] = []
+    for a in asset_rows:
+        for c in (a.get("top_cves") or []) if isinstance(a, dict) else []:
+            if isinstance(c, dict) and c.get("cve_id") not in seen and (c.get("kev") or c.get("metasploit_modules")):
+                seen.add(c["cve_id"])
+                evidence.append(c)
+    evidence.sort(key=lambda c: (not c.get("kev"), -(c.get("weaponization_score") or 0)))
+    if evidence:
+        render_vulnerability_detail(console, evidence, title="Exploited or weaponized CVEs", id_key="cve_id")
+    counts: dict[str, int] = {}
+    for tech in report.get("technique_catalog") or []:
+        for src in (tech.get("log_sources") or []) if isinstance(tech, dict) else []:
+            if isinstance(src, dict) and src.get("name"):
+                counts[src["name"]] = counts.get(src["name"], 0) + 1
+    if counts:
+        top = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+        console.print("[bold]Log sources to collect:[/bold] " + " · ".join(f"{escape(n)} ({k})" for n, k in top))
     if payload.get("enrichment_id"):
         console.print(f"[dim]Enrichment {payload['enrichment_id']}[/dim]")
     saved = payload.get("saved") if isinstance(payload.get("saved"), dict) else None
@@ -562,6 +746,26 @@ def scan_command(
     output.render(payload, _render_inventory_scan)
 
 
+def _render_imported(console: Console, payload: dict[str, Any]) -> None:
+    console.print(
+        f"[green]{'Updated' if payload.get('replaced') else 'Imported'}[/green] "
+        f"{payload.get('imported', payload.get('item_count', 0))} assets "
+        f"{'in' if payload.get('replaced') else '→'} inventory {payload.get('id', '')}"
+        + (f" [dim](mode: {payload['mode']})[/dim]" if payload.get("mode") else "")
+        + (
+            f" [yellow](+{payload['truncated']} dropped over the asset limit)[/yellow]"
+            if payload.get("truncated")
+            else ""
+        )
+        + (
+            f" [yellow]({payload['dropped']} SBOM dependency edges not retained)[/yellow]"
+            if payload.get("dropped")
+            else ""
+        )
+    )
+    _render_tlp_remark(console, payload)
+
+
 @app.command("import", help="Import an asset-inventory file — create an inventory, or edit an existing one's assets.")
 @handle_errors
 def import_command(
@@ -578,7 +782,7 @@ def import_command(
             "-f",
             show_default=False,
             help="File format (you pick it — no auto-detect): "
-            "json | sbom | csv | nmap | list | grype | trivy | depcheck | nessus | gvm | xlsx.",
+            "json | sbom | csv | nmap | list | grype | trivy | depcheck | nessus | gvm | xlsx | vex.",
         ),
     ],
     name: Annotated[str | None, typer.Option("--name", help="Inventory name (overrides the file's).")] = None,
@@ -600,12 +804,14 @@ def import_command(
 ) -> None:
     """Import via ``client.inventory_manager.import_inventory`` (the chosen per-format parser runs). With
     ``--into`` the file's assets replace (or, with ``--append``, add to) an existing inventory's inventory,
-    preserving its attachments / monitoring."""
+    preserving its attachments / monitoring. ``--format vex`` imports a VEX suppression overlay
+    (OpenVEX / CSAF) — it attaches to (``--into``) or creates an inventory holding the overlay; it does
+    NOT import assets (#324)."""
     fmt = fmt.lower()
     if fmt not in _IMPORT_FORMATS:
         raise BadInputError(f"Unknown --format '{fmt}'. One of: {', '.join(_IMPORT_FORMATS)}.")
     resolved = auth.resolve_auth()
-    # xlsx is binary — read bytes (the SDK base64-encodes them); the other 10 formats are text.
+    # xlsx is binary — read bytes (the SDK base64-encodes them); the other formats are text.
     content: str | bytes = file.read_bytes() if fmt == "xlsx" else file.read_text(encoding="utf-8", errors="replace")
     mode = "append" if append else "replace"
 
@@ -620,18 +826,20 @@ def import_command(
                 mode=mode,
             )
 
-    verb = "Updating" if into else "Importing"
+    is_vex = fmt == "vex"
+    verb = "Updating" if into else ("Importing" if not is_vex else "Attaching")
     payload = with_status(f"{verb} inventory…", _call())
-    output.render(
-        payload,
-        lambda c, p: c.print(
-            f"[green]{'Updated' if p.get('replaced') else 'Imported'}[/green] "
-            f"{p.get('imported', p.get('item_count', 0))} assets "
-            f"{'in' if p.get('replaced') else '→'} inventory {p.get('id', '')}"
-            + (f" [dim](mode: {p['mode']})[/dim]" if p.get("mode") else "")
-            + (f" [yellow](+{p['truncated']} dropped — 200 cap)[/yellow]" if p.get("truncated") else "")
-        ),
-    )
+    if is_vex:
+        output.render(
+            payload,
+            lambda c, p: c.print(
+                f"[green]{'Updated' if p.get('replaced') or p.get('vex_replaced') else 'Attached'}[/green] "
+                f"VEX overlay ({p.get('statements', 0)} statements) "
+                f"{'on' if p.get('vex_replaced') else '→'} inventory {p.get('id', '')}"
+            ),
+        )
+        return
+    output.render(payload, _render_imported)
 
 
 @app.command("import-multi", help="Combine SEVERAL files (different formats) into ONE inventory.")
@@ -715,7 +923,8 @@ def import_multi_command(
             f"{p.get('item_count', 0)} combined assets "
             f"{'in' if p.get('replaced') else '→'} inventory {p.get('id', '')}"
             + (f" [dim](mode: {p['mode']})[/dim]" if p.get("mode") else "")
-            + (f" [yellow](+{p['truncated']} dropped — 200 cap)[/yellow]" if p.get("truncated") else "")
+            + (f" [yellow](+{p['truncated']} dropped over the asset limit)[/yellow]" if p.get("truncated") else "")
+            + (f" [yellow]({p['dropped']} SBOM dependency edges not retained)[/yellow]" if p.get("dropped") else "")
             + "".join(
                 f"\n  [dim]· {escape(str(s.get('label', '?')))}: +{s.get('contributed', 0)} new"
                 + (f" — {escape(str(s['error']))}" if s.get("error") else "")
@@ -735,22 +944,30 @@ def export_command(
         typer.Option(
             "--format",
             "-f",
-            help="json | csv | list | cyclonedx | spdx | spdx2 | workbook "
-            "(json/csv/list round-trip via import; workbook is a binary .xlsx — needs --output).",
+            help="json | csv | list | cyclonedx | spdx | spdx2 | workbook | all "
+            "(json/csv/list round-trip via import; workbook (.xlsx) and all (.zip) are binary — need --output).",
         ),
     ] = "json",
     out: Annotated[
         Path | None,
         typer.Option("--output", "-o", help="Write to this file instead of stdout."),
     ] = None,
+    tlp: Annotated[
+        str | None,
+        tlp_option(
+            "TLP 2.0 marking written into the asset-inventory formats that have a slot, overriding the "
+            "inventory's stored TLP (cyclonedx, spdx, spdx2, workbook; default: the inventory's stored TLP). "
+            "json/csv/list have none and ignore it."
+        ),
+    ] = None,
 ) -> None:
     """Export an inventory via ``client.inventory_manager.export_inventory`` (the text/bytes IS the file)."""
     fmt = fmt.lower()
     if fmt not in _EXPORT_FORMATS:
         raise BadInputError(f"Unknown --format '{fmt}'. One of: {', '.join(_EXPORT_FORMATS)}.")
-    # workbook is a binary .xlsx — it can't go to stdout intact, so require an output file.
-    if fmt == "workbook" and out is None:
-        raise BadInputError("The 'workbook' export is a binary .xlsx — pass --output FILE to write it.")
+    # workbook (.xlsx) and all (.zip) are binary — they can't go to stdout intact, so require an output file.
+    if fmt in ("workbook", "all") and out is None:
+        raise BadInputError(f"The '{fmt}' export is binary — pass --output FILE to write it.")
     if out is not None:
         paths.ensure_writable_output(out)
         if out.exists():
@@ -759,11 +976,11 @@ def export_command(
 
     async def _call() -> str | bytes:
         async with build_client(resolved) as client:
-            return await client.inventory_manager.export_inventory(inventory_id, fmt=fmt)
+            return await client.inventory_manager.export_inventory(inventory_id, fmt=fmt, tlp=tlp_value(tlp))
 
     data = with_status("Exporting inventory…", _call())
     if isinstance(data, (bytes, bytearray)):
-        assert out is not None  # workbook is rejected above unless --output is present
+        assert out is not None  # binary formats are rejected above unless --output is present
         paths.write_atomic(out, data, overwrite=False)  # out is non-None (guarded above)
         Console().print(f"[green]Wrote[/green] {len(data)} bytes to [bold]{escape(str(out))}[/bold]")
     elif out is not None:

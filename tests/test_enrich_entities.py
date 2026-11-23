@@ -1,12 +1,12 @@
-"""End-to-end tests for the nine ``ccc enrich`` entity commands plus ``batch`` and ``poc-source``.
+"""End-to-end tests for the eleven ``ccc enrich`` entity commands plus ``batch`` and ``poc-source``.
 
-The nine entity commands (atlas, campaign, capec, defend, disarm, group,
-location, sector, software) share one shape — a direct id *or* ``--search``,
+The eleven entity commands (atlas, campaign, capec, cloak, defend, disarm, f3,
+group, location, sector, software) share one shape — a direct id *or* ``--search``,
 optionally a ``--framework`` — so they are covered by parametrized cases over
-:data:`_ENTITIES` rather than nine near-identical copies. What differs per
-command (which SDK method it calls, which payload key holds the entity, whether
-the id space has a canonical format worth rejecting locally) is data in that
-table, so a mis-wired command fails its own case.
+:data:`_ENTITIES` rather than eleven near-identical copies. What differs per
+command (which SDK method it calls, which payload key holds the entity, which
+id field names it, whether the id space has a canonical format worth rejecting
+locally) is data in that table, so a mis-wired command fails its own case.
 """
 
 from __future__ import annotations
@@ -23,17 +23,23 @@ from crimson_crawler_cli.exceptions import ExitCode
 from crimson_crawler_client import UnexpectedStatus
 
 # command, SDK method, entity payload key, id field, valid id, malformed id
-# (None = slug-shaped id space with no local format check), framework support.
+# (None = slug-shaped id space with no local format check), framework support,
+# technique layer key (None = the endpoint walks no technique hop at all).
 _ENTITIES = [
-    ("atlas", "enrich_atlas_full", "technique", "technique_id", "AML.T0043", "AML-T0043", False),
-    ("campaign", "enrich_campaign_full", "campaign", "campaign_id", "C0028", "C28", True),
-    ("capec", "enrich_capec_full", "attack_pattern", "capec_id", "CAPEC-66", "CAPEC66", False),
-    ("defend", "enrich_defend_full", "d3fend", "d3fend_id", "D3-AL", None, False),
-    ("disarm", "enrich_disarm_full", "technique", "technique_id", "T0001", "TT0001", False),
-    ("group", "enrich_group_full", "group", "group_id", "G0016", "G16", True),
-    ("location", "enrich_location_full", "location", "location_id", "L0001", None, False),
-    ("sector", "enrich_sector_full", "sector", "sector_id", "financial-services", None, False),
-    ("software", "enrich_software_full", "software", "software_id", "S0154", "S154", True),
+    ("atlas", "enrich_atlas_full", "technique", "technique_id", "AML.T0043", "AML-T0043", False, "techniques"),
+    ("campaign", "enrich_campaign_full", "campaign", "campaign_id", "C0028", "C28", True, "techniques"),
+    ("capec", "enrich_capec_full", "attack_pattern", "capec_id", "CAPEC-66", "CAPEC66", False, "techniques"),
+    # F3 and CLOAK return ``technique`` too, but their FrameworkObjectDetail names the
+    # framework id ``object_id``; CLOAK's corpus carries no ATT&CK references, so it walks
+    # no technique layer at all.
+    ("cloak", "enrich_cloak_full", "technique", "object_id", "TTP-496", "TTP496", False, None),
+    ("defend", "enrich_defend_full", "d3fend", "d3fend_id", "D3-AL", None, False, "techniques"),
+    ("disarm", "enrich_disarm_full", "technique", "technique_id", "T0001", "TT0001", False, "techniques"),
+    ("f3", "enrich_f3_full", "technique", "object_id", "F1031", "F-1031", False, "linked_techniques"),
+    ("group", "enrich_group_full", "group", "group_id", "G0016", "G16", True, "techniques"),
+    ("location", "enrich_location_full", "location", "location_id", "US", None, False, "techniques"),
+    ("sector", "enrich_sector_full", "sector", "sector_id", "financial-organizations", None, False, "techniques"),
+    ("software", "enrich_software_full", "software", "software_id", "S0154", "S154", True, "techniques"),
 ]
 
 _IDS = [entity[0] for entity in _ENTITIES]
@@ -50,8 +56,37 @@ def _stub_response(payload: dict) -> MagicMock:
     return response
 
 
-def _entity_payload(key: str, id_field: str, identifier: str) -> dict:
-    return {
+def test_group_command_collects_technique_pages(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, clean_env: Path, mock_sdk
+) -> None:
+    monkeypatch.setenv("CRIMSON_CRAWLER_API_KEY", "test-key-1234")
+    mock_sdk.enrich_group_full.side_effect = [
+        _stub_response(
+            {
+                "snapshot_id": "a" * 32,
+                "group": {"group_id": "G0016", "techniques": [{"technique_id": "T0001"}]},
+                "techniques_next_offset": 10,
+                "errors": [],
+            }
+        ),
+        _stub_response(
+            {
+                "snapshot_id": "a" * 32,
+                "group": {"group_id": "G0016", "techniques": [{"technique_id": "T0002"}]},
+                "techniques_next_offset": None,
+                "errors": [],
+            }
+        ),
+    ]
+    result = runner.invoke(app, ["--json", "enrich", "group", "G0016"])
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert [row["technique_id"] for row in payload["group"]["techniques"]] == ["T0001", "T0002"]
+
+
+def _entity_payload(key: str, id_field: str, identifier: str, technique_layer: str | None) -> dict:
+    """Build an entity payload, hanging the technique rows off the layer that endpoint uses."""
+    payload = {
         key: {
             id_field: identifier,
             "name": "Example Entity",
@@ -59,15 +94,21 @@ def _entity_payload(key: str, id_field: str, identifier: str) -> dict:
             "aliases": ["Alias One"],
             "url": "https://example.test/entity",
         },
-        "techniques": [{"technique_id": "T1190", "name": "Exploit Public-Facing App", "tactics": ["initial-access"]}],
         "errors": [],
     }
+    if key == "group":
+        payload.update(snapshot_id="a" * 32, techniques_next_offset=None, log_source_catalog=[], log_source_refs={})
+    if technique_layer:
+        payload[technique_layer] = [
+            {"technique_id": "T1190", "name": "Exploit Public-Facing App", "tactics": ["initial-access"]}
+        ]
+    return payload
 
 
 # -- the nine entity commands --------------------------------------------------- #
 
 
-@pytest.mark.parametrize("command,method,key,id_field,valid,_bad,_fw", _ENTITIES, ids=_IDS)
+@pytest.mark.parametrize("command,method,key,id_field,valid,_bad,_fw,layer", _ENTITIES, ids=_IDS)
 def test_entity_direct_id_renders_table(
     command: str,
     method: str,
@@ -76,23 +117,26 @@ def test_entity_direct_id_renders_table(
     valid: str,
     _bad: str | None,
     _fw: bool,
+    layer: str | None,
     runner: CliRunner,
     monkeypatch: pytest.MonkeyPatch,
     clean_env: Path,
     mock_sdk,
 ) -> None:
     monkeypatch.setenv("CRIMSON_CRAWLER_API_KEY", "test-key-1234")
-    getattr(mock_sdk, method).return_value = _stub_response(_entity_payload(key, id_field, valid))
+    getattr(mock_sdk, method).return_value = _stub_response(_entity_payload(key, id_field, valid, layer))
 
     result = runner.invoke(app, ["enrich", command, valid])
 
     assert result.exit_code == 0, result.stdout + result.stderr
+    assert valid in result.stdout  # the ID row reads the endpoint's own id field
     assert "Example Entity" in result.stdout
-    assert "T1190" in result.stdout  # the shared linked-techniques sub-table
+    if layer:
+        assert "T1190" in result.stdout  # the shared linked-techniques sub-table
     getattr(mock_sdk, method).assert_awaited_once()
 
 
-@pytest.mark.parametrize("command,method,key,id_field,valid,_bad,framework", _ENTITIES, ids=_IDS)
+@pytest.mark.parametrize("command,method,key,id_field,valid,_bad,framework,layer", _ENTITIES, ids=_IDS)
 def test_entity_passes_identifier_and_framework(
     command: str,
     method: str,
@@ -101,6 +145,7 @@ def test_entity_passes_identifier_and_framework(
     valid: str,
     _bad: str | None,
     framework: bool,
+    layer: str | None,
     runner: CliRunner,
     monkeypatch: pytest.MonkeyPatch,
     clean_env: Path,
@@ -109,7 +154,7 @@ def test_entity_passes_identifier_and_framework(
     """The positional lands as the SDK's first arg; ``--framework`` only where it exists."""
     monkeypatch.setenv("CRIMSON_CRAWLER_API_KEY", "test-key-1234")
     mocked = getattr(mock_sdk, method)
-    mocked.return_value = _stub_response(_entity_payload(key, id_field, valid))
+    mocked.return_value = _stub_response(_entity_payload(key, id_field, valid, layer))
 
     result = runner.invoke(app, ["enrich", command, valid])
 
@@ -123,7 +168,7 @@ def test_entity_passes_identifier_and_framework(
         assert "framework" not in kwargs
 
 
-@pytest.mark.parametrize("command,method,key,id_field,valid,_bad,_fw", _ENTITIES, ids=_IDS)
+@pytest.mark.parametrize("command,method,key,id_field,valid,_bad,_fw,layer", _ENTITIES, ids=_IDS)
 def test_entity_json_round_trip(
     command: str,
     method: str,
@@ -132,13 +177,14 @@ def test_entity_json_round_trip(
     valid: str,
     _bad: str | None,
     _fw: bool,
+    layer: str | None,
     runner: CliRunner,
     monkeypatch: pytest.MonkeyPatch,
     clean_env: Path,
     mock_sdk,
 ) -> None:
     monkeypatch.setenv("CRIMSON_CRAWLER_API_KEY", "test-key-1234")
-    payload = _entity_payload(key, id_field, valid)
+    payload = _entity_payload(key, id_field, valid, layer)
     getattr(mock_sdk, method).return_value = _stub_response(payload)
 
     result = runner.invoke(app, ["--json", "enrich", command, valid])
@@ -147,7 +193,7 @@ def test_entity_json_round_trip(
     assert json.loads(result.stdout) == payload
 
 
-@pytest.mark.parametrize("command,method,key,id_field,_valid,_bad,_fw", _ENTITIES, ids=_IDS)
+@pytest.mark.parametrize("command,method,key,id_field,_valid,_bad,_fw,_layer", _ENTITIES, ids=_IDS)
 def test_entity_search_renders_matches(
     command: str,
     method: str,
@@ -156,6 +202,7 @@ def test_entity_search_renders_matches(
     _valid: str,
     _bad: str | None,
     _fw: bool,
+    _layer: str | None,
     runner: CliRunner,
     monkeypatch: pytest.MonkeyPatch,
     clean_env: Path,
@@ -164,9 +211,10 @@ def test_entity_search_renders_matches(
     """``--search`` sends no identifier and renders the ``search_results`` table."""
     monkeypatch.setenv("CRIMSON_CRAWLER_API_KEY", "test-key-1234")
     mocked = getattr(mock_sdk, method)
-    mocked.return_value = _stub_response(
-        {"search_results": [{id_field: "X0001", "name": "Matched Entity"}], "errors": []}
-    )
+    payload = {"search_results": [{id_field: "X0001", "name": "Matched Entity"}], "errors": []}
+    if command == "group":
+        payload["snapshot_id"] = "a" * 32
+    mocked.return_value = _stub_response(payload)
 
     result = runner.invoke(app, ["enrich", command, "--search", "example query"])
 
@@ -177,7 +225,7 @@ def test_entity_search_renders_matches(
     assert kwargs["search"] == "example query"
 
 
-@pytest.mark.parametrize("command,method,_key,_id_field,_valid,_bad,_fw", _ENTITIES, ids=_IDS)
+@pytest.mark.parametrize("command,method,_key,_id_field,_valid,_bad,_fw,_layer", _ENTITIES, ids=_IDS)
 def test_entity_requires_id_or_search_exits_64(
     command: str,
     method: str,
@@ -186,6 +234,7 @@ def test_entity_requires_id_or_search_exits_64(
     _valid: str,
     _bad: str | None,
     _fw: bool,
+    _layer: str | None,
     runner: CliRunner,
     monkeypatch: pytest.MonkeyPatch,
     clean_env: Path,
@@ -199,7 +248,7 @@ def test_entity_requires_id_or_search_exits_64(
     getattr(mock_sdk, method).assert_not_awaited()
 
 
-@pytest.mark.parametrize("command,method,_key,_id_field,valid,_bad,_fw", _ENTITIES, ids=_IDS)
+@pytest.mark.parametrize("command,method,_key,_id_field,valid,_bad,_fw,_layer", _ENTITIES, ids=_IDS)
 def test_entity_rejects_id_and_search_together_exits_64(
     command: str,
     method: str,
@@ -208,6 +257,7 @@ def test_entity_rejects_id_and_search_together_exits_64(
     valid: str,
     _bad: str | None,
     _fw: bool,
+    _layer: str | None,
     runner: CliRunner,
     monkeypatch: pytest.MonkeyPatch,
     clean_env: Path,
@@ -248,6 +298,8 @@ def test_entity_malformed_id_exits_64_without_network(
     [
         ("atlas", "enrich_atlas_full", "aml.t0043", "AML.T0043"),
         ("campaign", "enrich_campaign_full", "c0028", "C0028"),
+        ("cloak", "enrich_cloak_full", "ttp-496", "TTP-496"),
+        ("f3", "enrich_f3_full", "f1031", "F1031"),
         ("group", "enrich_group_full", "g0016", "G0016"),
         ("software", "enrich_software_full", "s0154", "S0154"),
     ],
@@ -264,7 +316,8 @@ def test_entity_canonical_ids_are_upper_cased(
 ) -> None:
     monkeypatch.setenv("CRIMSON_CRAWLER_API_KEY", "test-key-1234")
     mocked = getattr(mock_sdk, method)
-    mocked.return_value = _stub_response({"errors": []})
+    payload = {"errors": [], **({"snapshot_id": "a" * 32} if method == "enrich_group_full" else {})}
+    mocked.return_value = _stub_response(payload)
 
     result = runner.invoke(app, ["enrich", command, lowered])
 
@@ -279,10 +332,10 @@ def test_entity_slug_id_sent_verbatim(
     monkeypatch.setenv("CRIMSON_CRAWLER_API_KEY", "test-key-1234")
     mock_sdk.enrich_sector_full.return_value = _stub_response({"errors": []})
 
-    result = runner.invoke(app, ["enrich", "sector", "financial-services"])
+    result = runner.invoke(app, ["enrich", "sector", "financial-organizations"])
 
     assert result.exit_code == 0, result.stdout + result.stderr
-    assert mock_sdk.enrich_sector_full.call_args.args == ("financial-services",)
+    assert mock_sdk.enrich_sector_full.call_args.args == ("financial-organizations",)
 
 
 def test_entity_empty_response_reports_no_data(
@@ -396,6 +449,20 @@ def test_batch_json_round_trip(runner: CliRunner, monkeypatch: pytest.MonkeyPatc
     assert json.loads(result.stdout) == _BATCH_RESULT
 
 
+def test_batch_takes_no_include_option(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, clean_env: Path, mock_sdk
+) -> None:
+    """Each item carries its own ``include``, so a command-level one could never apply."""
+    monkeypatch.setenv("CRIMSON_CRAWLER_API_KEY", "test-key-1234")
+
+    result = runner.invoke(app, ["enrich", "batch", "--include", "versions", "--item", '{"type":"atlas"}'])
+
+    # The CLI rebinds Click's usage-error family to `BAD_INPUT` (64) so exit 2 means ONLY "no API
+    # key" — an unknown option is a usage error like any other local validation failure.
+    assert result.exit_code == int(ExitCode.BAD_INPUT)
+    mock_sdk.enrich_batch.assert_not_awaited()
+
+
 def test_batch_output_file_write(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch, clean_env: Path, mock_sdk, tmp_path: Path
 ) -> None:
@@ -491,6 +558,19 @@ def test_poc_source_happy_path(runner: CliRunner, monkeypatch: pytest.MonkeyPatc
     assert result.exit_code == 0, result.stdout + result.stderr
     assert "liblzma" in result.stdout
     mock_sdk.enrich_poc_source.assert_awaited_once_with("https://github.com/amlweems/xzbot")
+
+
+def test_poc_source_takes_no_include_option(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, clean_env: Path, mock_sdk
+) -> None:
+    """``FetchPoCSourceRequest`` declares no ``include``, so the flag must not come back."""
+    monkeypatch.setenv("CRIMSON_CRAWLER_API_KEY", "test-key-1234")
+
+    result = runner.invoke(app, ["enrich", "poc-source", "https://github.com/o/r", "--include", "details"])
+
+    # Same usage-error remap as the batch case above: 64, not Click's default 2.
+    assert result.exit_code == int(ExitCode.BAD_INPUT)
+    mock_sdk.enrich_poc_source.assert_not_awaited()
 
 
 def test_poc_source_json_round_trip(

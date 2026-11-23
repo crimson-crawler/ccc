@@ -22,6 +22,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from crimson_crawler_client import Tlp
+
 from .. import auth, output, paths
 from ..client_factory import build_client
 from ..exceptions import BadInputError
@@ -108,6 +110,54 @@ def _render_artifact_enrich(console: Any, payload: dict[str, Any]) -> None:
             action_table.add_row(_formatters._maybe(action), _formatters._trim(detail, 100))
         console.print(action_table)
 
+    # Report schema 2.2 — per-CVE exploit evidence, then the threat context the engine resolved.
+    cves = [r for r in references if isinstance(r, dict) and r.get("type") == "cve"]
+    cves.sort(key=lambda r: (not (r.get("kev") or r.get("kev_due_date")), -(r.get("score") or 0)))
+    if cves:
+        _formatters.render_vulnerability_detail(console, cves, title="Vulnerabilities", id_key="value")
+    _render_threat_context(console, references, report.get("rollups"))
+
+
+def _render_threat_context(console: Any, references: list[Any], rollups: Any) -> None:
+    """Targets (with the actors known to target them), named groups' reach, and likely next techniques."""
+    from rich.markup import escape
+
+    lines: list[str] = []
+    for ref in references:
+        if not isinstance(ref, dict) or ref.get("type") not in ("location", "sector"):
+            continue
+        profile = ref.get(ref["type"]) if isinstance(ref.get(ref["type"]), dict) else {}
+        name = profile.get("name") or ref.get("value")
+        targeting = ref.get("threat_actors_targeting") or []
+        who = f"targeted by {len(targeting)} known actors" if targeting else "no known targeting actors"
+        lines.append(f"{escape(str(name))} ({ref['type']}): {who}")
+    for ref in references:
+        if not isinstance(ref, dict) or ref.get("type") != "group":
+            continue
+        grp = ref.get("group") if isinstance(ref.get("group"), dict) else {}
+        risk = ref.get("group_risk") if isinstance(ref.get("group_risk"), dict) else {}
+        if not (grp or risk):
+            continue
+        worst = risk.get("max_weaponization")
+        lines.append(
+            f"{escape(str(grp.get('name') or ref.get('value')))} (threat group): worst CVE in reach "
+            f"{round(worst) if isinstance(worst, (int, float)) else '—'}, "
+            f"{risk.get('exploitable_cve_count', 0)} CVEs in reach, {risk.get('kev_cve_count', 0)} on KEV"
+        )
+    preds: dict[str, float] = {}
+    for key in ("technique_coverage", "group_exposure"):
+        block = rollups.get(key) if isinstance(rollups, dict) and isinstance(rollups.get(key), dict) else {}
+        for p in block.get("predictions") or []:
+            if isinstance(p, dict) and p.get("technique_id") and isinstance(p.get("probability"), (int, float)):
+                preds[p["technique_id"]] = max(preds.get(p["technique_id"], 0.0), float(p["probability"]))
+    if preds:
+        top = sorted(preds.items(), key=lambda kv: -kv[1])[:5]
+        lines.append("Likely next: " + ", ".join(f"{escape(t)} {p * 100:.0f}%" for t, p in top))
+    if lines:
+        console.print("[bold]Threat context[/bold]")
+        for line in lines:
+            console.print(f"  {line}")
+
 
 def _count_actions(references: list[Any]) -> dict[str, int]:
     """Tally PATCH / BLOCK / WATCH / INFO recommended actions across references.
@@ -141,14 +191,23 @@ def artifact_enrich_command(
     *,
     text: str | None = None,
     files: list[Path] | None = None,
+    attached_artifact_ids: list[str] | None = None,
     depth: Depth = Depth.full,
     output_path: Path | None = None,
     save: bool = False,
+    tlp: Tlp | None = None,
 ) -> None:
     """Submit text + files to the Artifact Enricher engine, poll, and summarize the report.
 
     ``save=True`` files the finished report into your Artifact Manager library once it completes (the
     ``/v1`` engine returns the report but never persists it) — usage-exempt.
+
+    ``attached_artifact_ids`` names the stored artifacts the ``--text`` content came from, so the
+    report's ``attachment_sources`` says where its references came from instead of leaving them
+    unattributed.
+
+    ``tlp`` is the optional TLP 2.0 marking written into the exported formats that carry one (default
+    ``AMBER``; ``openvex``/``csv``/``emass`` have no marking slot).
     """
     file_list = list(files or [])
     if not text and not file_list:
@@ -164,7 +223,13 @@ def artifact_enrich_command(
         async def _inner() -> dict[str, Any]:
             async with build_client(resolved) as client:
                 return await client.enricher.enrich(
-                    text=text, files=staged, include=include, on_progress=on_progress, save=save
+                    text=text,
+                    files=staged,
+                    attached_artifact_ids=list(attached_artifact_ids) if attached_artifact_ids else None,
+                    include=include,
+                    on_progress=on_progress,
+                    save=save,
+                    tlp=tlp,
                 )
 
         return _inner()

@@ -114,9 +114,34 @@ def load_config_file() -> dict[str, Any] | None:
         raise ConfigFileError(_malformed_config_message(text, str(exc))) from exc
 
 
+def config_file_status() -> tuple[str, str | None]:
+    """Report whether ``CONFIG_FILE`` exists and would be read, WITHOUT raising.
+
+    Returns ``("absent", None)``, ``("present", None)``, or ``("refused", reason)`` where
+    ``reason`` is the same remediation text :func:`load_config_file` would have raised.
+    This is the diagnostic twin of :func:`load_config_file` for ``ccc whoami`` (#252):
+    the loader is only ever consulted when the env var is unset, so a refused file behind
+    a set env var used to be reported as "not present" with exit 0 — the one state a user
+    debugging "why isn't ccc reading my config" most needs to see. Nothing is parsed here;
+    a present-but-malformed file still reports ``present`` (the loader names that mistake
+    the moment the file is actually used).
+    """
+    try:
+        with CONFIG_FILE.open("rb") as fh:
+            _validate_permissions(fh.fileno())
+    except FileNotFoundError:
+        return "absent", None
+    except ConfigPermissionError as exc:  # before PermissionError — it is a subclass
+        return "refused", str(exc)
+    except PermissionError as exc:  # the OS refused the open itself
+        return "refused", f"Cannot read {CONFIG_FILE}: {exc.strerror or exc}."
+    return "present", None
+
+
 __all__ = [
     "CONFIG_DIR",
     "CONFIG_FILE",
     "EXPECTED_SHAPE",
+    "config_file_status",
     "load_config_file",
 ]

@@ -1,6 +1,6 @@
 [project]
 name = "crimson-crawler-cli"
-version = "4.1.2"
+version = "5.0.0"
 description = "Command-line interface for the Crimson Crawler API"
 dynamic = ["readme"]  # supplied by hatch_build.py:PackagedReadmeUrls
 requires-python = ">=3.11"
@@ -25,7 +25,7 @@ dependencies = [
     "rich>=13",
     "defusedxml>=0.7",
     "packageurl-python>=0.15",
-    "crimson-crawler-client>=4.0,<5.0",
+    "crimson-crawler-client>=5.0,<6.0",
 ]
 
 [project.urls]
@@ -33,11 +33,20 @@ Homepage = "https://crimsoncrawler.com"
 Repository = "https://github.com/crimson-crawler/ccc"
 Documentation = "https://crimsoncrawler.com/docs/clients/cli/"
 
+[tool.uv]
+# Security floor for a transitive dep (CC-9.1 pattern used by the root pyproject):
+# certifi arrives via httpx (through crimson-crawler-client). The lock is the pin;
+# this floor keeps a re-lock from silently resolving a vulnerable certifi
+# (GHSA-6q48-6c7w-9gw2).
+constraint-dependencies = [
+    "certifi>=2026.10.19",
+]
+
 # uv-only override: build the CLI against the in-repo SDK during development.
 # `uv` strips this table when constructing the published wheel, so consumers
 # install `crimson-crawler-client` from PyPI as usual.
 [tool.uv.sources]
-crimson-crawler-client = { git = "https://github.com/crimson-crawler/python-sdk.git", tag = "v4.1.1" }
+crimson-crawler-client = { git = "https://github.com/crimson-crawler/python-sdk.git", tag = "v5.0.0" }
 
 [project.optional-dependencies]
 dev = [
@@ -74,11 +83,11 @@ testpaths = ["tests"]
 [tool.coverage.run]
 source = ["crimson_crawler_cli"]
 
-# 80% floor on the public command surface (matches the SDK gates).
-# Was 90 (never enforced); crawl.py's offline SBOM walker sits at ~52% and is
-# tracked as a follow-up, so 90 would false-fail the whole suite at 87%.
+# 90% floor on the public command surface (matches the SDK gates). Measured 2026-09-21:
+# 94.3% total, and crawl.py — the reason this was briefly lowered to 80 — is at 92%, so
+# the floor no longer needs slack for it.
 [tool.coverage.report]
-fail_under = 80
+fail_under = 90
 exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "raise NotImplementedError"]
 
 [tool.mypy]
@@ -88,6 +97,19 @@ no_implicit_optional = true
 warn_redundant_casts = true
 warn_unused_ignores = true
 ignore_missing_imports = true
+
+# Per-module, not tree-wide: the four `commands/` renderers unwrap the SDK's nullable report
+# fields through chains of `.get()`, so `union-attr`/`arg-type` fire on values each of them has
+# already defaulted with `isinstance(...)`. `no-redef` is the two same-named nested `_call`
+# closures in `inventory_manager.py`. Silencing these three codes here keeps every other module —
+# and every module added later — under full checking.
+[[tool.mypy.overrides]]
+module = [
+    "crimson_crawler_cli.commands._formatters",
+    "crimson_crawler_cli.commands.enrich_artifact",
+    "crimson_crawler_cli.commands.enrich_event",
+    "crimson_crawler_cli.commands.inventory_manager",
+]
 disable_error_code = ["arg-type", "no-redef", "union-attr"]
 
 [tool.ruff]

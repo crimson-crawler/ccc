@@ -105,6 +105,23 @@ def test_inventory_enrich_from_file_with_full_asset_fields(
     assert kwargs["attachments_text"] == "ticket context"
 
 
+def test_inventory_enrich_forwards_named_attachment_provenance(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, clean_env: Path, mock_sdk
+) -> None:
+    """``--attach-id`` names the stored artifacts the attachment text came from — the engine records them
+    as the report's sources instead of leaving the attribution blank."""
+    monkeypatch.setenv("CRIMSON_CRAWLER_API_KEY", "test-key-1234")
+    mock_sdk.inventory_enrich.return_value = _stub_response(_SUBMIT)
+
+    result = runner.invoke(
+        app,
+        ["inventory-enrich", "--product", "nginx", "--attachments-text", "ctx", "--attach-id", "art-1"],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert mock_sdk.inventory_enrich.call_args.kwargs["attached_artifact_ids"] == ["art-1"]
+
+
 def test_inventory_enrich_file_and_products_combine(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch, clean_env: Path, mock_sdk, tmp_path: Path
 ) -> None:

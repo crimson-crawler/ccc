@@ -1,18 +1,28 @@
 """``ccc ingest <format> <file>`` — parse a scan, enrich discovered assets, emit a briefing.
 
-A thin shell over the SDK's scan→briefing workflow: read the file, call
-``client.inventory_manager.ingest_scan(content, format)`` — which parses the scan
-server-side into asset items (all 11 formats), enriches them against the
+A thin shell over the SDK's scan→briefing workflow: read the file, call the SDK's shared
+:func:`crimson_crawler_client.ingest_scan` component with ``client.inventory_manager`` — which parses the scan
+server-side into asset items (all 12 formats), enriches them against the
 ``/v1/inventory-enrich`` KEV-first ranking engine, and returns a structured briefing —
 then render a Markdown playbook (or the raw JSON briefing under ``--json``, the shared
 :data:`output.JsonFlag` trailing twin of the global flag).
 
-All 11 scan/inventory formats are supported (json/sbom/csv/nmap/list/grype/trivy/depcheck/nessus/gvm/xlsx);
+All 12 scan/inventory formats are supported (json/sbom/csv/nmap/list/grype/trivy/depcheck/nessus/gvm/xlsx/vex);
 the parsing + ranking now live server-side / in the SDK, so the CLI owns only the
-Markdown rendering (:func:`playbook.render_briefing`). ``--expand`` (shared
-:data:`output.ExpandFlag`) lifts the per-finding CVE-description cap. The single
-``/v1/inventory-enrich`` submit is the only billable call (cheaper than enriching each
-product separately).
+Markdown rendering (:func:`playbook.render_briefing`).
+
+The rendering is **destination-aware** — one briefing, two sinks. A bare interactive
+terminal gets plain, unescaped text (the Markdown escape backslashes are literal noise
+there); ``--output``, a shell redirect, and a pipe all get injection-safe escaped
+Markdown. A pager (``| less``) is a non-TTY and therefore gets the escaped form — the
+same convention every colorizing CLI follows, and the alternative would break
+``> out.md``. Sanitization (NFC, control-char stripping, single-line collapse) applies to
+both sinks; only the Markdown/HTML escaping is destination-specific.
+
+``--expand`` (shared :data:`output.ExpandFlag`) lifts the per-finding CVE-description cap
+(``playbook._DESC_CAP``), rendering each description in full instead of cutting it at 500
+characters with a trailing ``…``. The single ``/v1/inventory-enrich`` submit is the only
+billable call (cheaper than enriching each product separately).
 """
 
 from __future__ import annotations
@@ -24,14 +34,16 @@ from typing import Annotated, Any
 
 import typer
 
+from crimson_crawler_client import ingest_scan
+
 from .. import auth, output, paths, playbook
-from .. import ingest as ingest_lib
 from ..client_factory import build_client
 from ..exceptions import BadInputError, handle_errors
 from . import _formatters
 
-# The 11 scan/inventory formats the parse endpoint accepts (no auto-detection — you PICK one).
-FORMATS = ["json", "sbom", "csv", "nmap", "list", "grype", "trivy", "depcheck", "nessus", "gvm", "xlsx"]
+# The scan/inventory formats the parse endpoint accepts (no auto-detection — you PICK one).
+# `vex` rides the same server parse door (a VEX suppression overlay — OpenVEX / CSAF).
+FORMATS = ["json", "sbom", "csv", "nmap", "list", "grype", "trivy", "depcheck", "nessus", "gvm", "xlsx", "vex"]
 
 
 @handle_errors
@@ -72,7 +84,7 @@ def ingest_command(
     def _call(on_progress: Any) -> Any:
         async def _inner() -> dict[str, Any]:
             async with build_client(resolved) as client:
-                return await ingest_lib.ingest_scan(client.inventory_manager, content, fmt, on_progress=on_progress)
+                return await ingest_scan(client.inventory_manager, content, fmt, on_progress=on_progress)
 
         return _inner()
 
@@ -81,7 +93,13 @@ def ingest_command(
     if output.is_json_mode():
         rendered = _jsonlib.dumps(briefing, indent=2, sort_keys=True) + "\n"
     else:
-        rendered = playbook.render_briefing(briefing, scan_file=scan_file.name, expand=output.is_expand_mode())
+        # `plain` is computed INSIDE this branch, so `--json` is untouched by construction.
+        # Progress UI is on stderr (`_formatters.with_live_progress`), so nothing interleaves
+        # with a redirect. Destination rules are in the module docstring.
+        plain = output_path is None and output.stdout_is_tty()
+        rendered = playbook.render_briefing(
+            briefing, scan_file=scan_file.name, expand=output.is_expand_mode(), plain=plain
+        )
 
     if output_path is not None:
         paths.write_atomic(output_path, rendered)

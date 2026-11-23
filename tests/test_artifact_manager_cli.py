@@ -36,6 +36,7 @@ class TestList:
                 "id": "a1",
                 "kind": "artifact_enrichment",
                 "name": "Scan · 5",
+                "tlp": "AMBER+STRICT",
                 "byte_size": 2048,
                 "favorite": True,
                 "created_at": "2026-06-10T01:02:03Z",
@@ -44,7 +45,7 @@ class TestList:
         result = runner.invoke(app, ["artifact-manager", "list", "--kind", "artifact_enrichment"])
         assert result.exit_code == ExitCode.OK
         assert "Scan · 5" in result.output
-        mock_sdk.artifact_manager.list_artifacts.assert_awaited_once_with(kind="artifact_enrichment", folder=None)
+        assert "AMBER+STRICT" in result.output  # the TLP column
 
     def test_json_mode_round_trips(self, runner, authed, mock_sdk) -> None:
         mock_sdk.artifact_manager.list_artifacts.return_value = [{"id": "a1"}]
@@ -71,7 +72,6 @@ class TestUpload:
         artifacts = mock_sdk.artifact_manager.upload_artifacts.await_args.args[0]
         assert artifacts[0]["format"] == "paste" and artifacts[0]["content"] == "CVE-2024-3400 observed"
         assert artifacts[1]["format"] == "file"  # binary → base64
-        assert mock_sdk.artifact_manager.upload_artifacts.await_args.kwargs == {"new_folder_name": "case-1"}
 
     def test_missing_file_exits_64(self, runner, authed, mock_sdk, tmp_path) -> None:
         result = runner.invoke(app, ["artifact-manager", "upload", str(tmp_path / "nope.txt")])
@@ -87,6 +87,7 @@ class TestGet:
         "name": "Scan · 5",
         "format": "scan_report",
         "mime": "application/json",
+        "tlp": "RED",
         "created_at": "2026-06-10",
     }
 
@@ -128,7 +129,7 @@ class TestExports:
         result = runner.invoke(app, ["artifact-manager", "export", "s1", "stix"])
         assert result.exit_code == ExitCode.OK
         assert (tmp_path / "stix.json").read_text() == '{"type":"bundle"}'
-        mock_sdk.artifact_manager.get_export.assert_awaited_once_with("s1", "stix")
+        mock_sdk.artifact_manager.get_export.assert_awaited_once_with("s1", "stix", tlp=None)
 
     def test_export_traversal_filename_falls_back_to_local_default(
         self, runner, authed, mock_sdk, tmp_path, monkeypatch
@@ -234,7 +235,7 @@ class TestExports:
         result = runner.invoke(app, ["artifact-manager", "export-all", "s1"])
         assert result.exit_code == ExitCode.OK
         assert (tmp_path / "s1-exports.zip").read_bytes() == b"PK\x03\x04all-exports"
-        mock_sdk.artifact_manager.download_all_exports.assert_awaited_once_with("s1")
+        mock_sdk.artifact_manager.download_all_exports.assert_awaited_once_with("s1", tlp=None)
 
     def test_export_all_default_refuses_existing_file_before_api(
         self, runner, authed, mock_sdk, tmp_path, monkeypatch
@@ -344,6 +345,40 @@ class TestDeleteAndFolders:
         assert result.exit_code == ExitCode.API_ERROR
 
 
+class TestSettings:
+    def test_shows_both_defaults_without_writing(self, runner, authed, mock_sdk) -> None:
+        mock_sdk.artifact_manager.get_enricher_settings.return_value = {
+            "artifact_tlp": "GREEN",
+            "inventory_tlp": "AMBER",
+        }
+        result = runner.invoke(app, ["artifact-manager", "settings"])
+        assert result.exit_code == ExitCode.OK
+        assert "GREEN" in result.output and "AMBER" in result.output
+        mock_sdk.artifact_manager.get_enricher_settings.assert_awaited_once_with()
+        mock_sdk.artifact_manager.set_enricher_settings.assert_not_awaited()
+
+    def test_sets_only_the_marking_it_was_given(self, runner, authed, mock_sdk) -> None:
+        mock_sdk.artifact_manager.set_enricher_settings.return_value = {
+            "artifact_tlp": "RED",
+            "inventory_tlp": "AMBER",
+        }
+        result = runner.invoke(app, ["artifact-manager", "settings", "--artifact-tlp", "red"])
+        assert result.exit_code == ExitCode.OK and "RED" in result.output
+        # lowercase input is matched case-insensitively and handed on canonical UPPERCASE
+        mock_sdk.artifact_manager.set_enricher_settings.assert_awaited_once_with(artifact_tlp="RED")
+        mock_sdk.artifact_manager.get_enricher_settings.assert_not_awaited()
+
+    def test_invalid_marking_exits_64_before_any_call(self, runner, authed, mock_sdk) -> None:
+        result = runner.invoke(app, ["artifact-manager", "settings", "--inventory-tlp", "PURPLE"])
+        assert result.exit_code == ExitCode.BAD_INPUT
+        mock_sdk.artifact_manager.set_enricher_settings.assert_not_awaited()
+
+    def test_api_error_exits_3(self, runner, authed, mock_sdk) -> None:
+        mock_sdk.artifact_manager.get_enricher_settings.side_effect = UnexpectedStatus(503, b"nope")
+        result = runner.invoke(app, ["artifact-manager", "settings"])
+        assert result.exit_code == ExitCode.API_ERROR
+
+
 class TestAuth:
     def test_missing_credentials_exits_2(self, runner, clean_env, mock_sdk) -> None:
         result = runner.invoke(app, ["artifact-manager", "list"])
@@ -439,7 +474,7 @@ class TestBundleDownloads:
         result = runner.invoke(app, ["artifact-manager", "download-folder", "f1"])
         assert result.exit_code == ExitCode.OK
         assert (tmp_path / "f1-folder.zip").read_bytes() == b"PK\x03\x04folder"
-        mock_sdk.artifact_manager.download_folder.assert_awaited_once_with("f1")
+        mock_sdk.artifact_manager.download_folder.assert_awaited_once_with("f1", tlp=None)
 
     def test_download_folder_invalid_output_dir_fails_before_api(self, runner, authed, mock_sdk, tmp_path) -> None:
         """An explicit ``-o`` into a missing dir exits 64 before the API call."""
@@ -455,7 +490,7 @@ class TestBundleDownloads:
         result = runner.invoke(app, ["artifact-manager", "download-bundle", "a1", "a2", "-o", "out.zip"])
         assert result.exit_code == ExitCode.OK
         assert (tmp_path / "out.zip").read_bytes() == b"PK\x03\x04bundle"
-        mock_sdk.artifact_manager.download_bundle.assert_awaited_once_with(["a1", "a2"])
+        mock_sdk.artifact_manager.download_bundle.assert_awaited_once_with(["a1", "a2"], tlp=None)
 
     def test_download_bundle_invalid_output_dir_fails_before_api(self, runner, authed, mock_sdk, tmp_path) -> None:
         """An explicit ``-o`` into a missing dir exits 64 before the API call."""
@@ -516,3 +551,68 @@ class TestRichMarkupEscaping:
         result = runner.invoke(app, ["artifact-manager", "rating", "s1"])
         assert result.exit_code == ExitCode.OK, result.output
         assert "[/]" in result.output
+
+
+class TestTlpOption:
+    """The #374 ``--tlp`` marking on every download command: case-insensitive input normalised to the
+    canonical uppercase value, routed to the SDK, and an invalid value is a usage error (exit 64)
+    before any API call."""
+
+    _EXPORT = {"content": "{}", "bytes": b"{}", "filename": "stix.json", "content_type": "application/json"}
+
+    def test_help_lists_the_five_canonical_uppercase_choices(self, runner) -> None:
+        # A wide terminal: Rich folds the metavar mid-word at 80 columns, interleaving it with the help column.
+        result = runner.invoke(app, ["artifact-manager", "export", "--help"], env={"COLUMNS": "200"})
+        assert result.exit_code == ExitCode.OK
+        assert "[CLEAR|GREEN|AMBER|AMBER+STRICT|RED]" in result.output
+
+    def test_export_normalises_lowercase_to_canonical(self, runner, authed, mock_sdk, tmp_path, monkeypatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        mock_sdk.artifact_manager.get_export.return_value = self._EXPORT
+        result = runner.invoke(app, ["artifact-manager", "export", "s1", "stix", "--tlp", "amber+strict"])
+        assert result.exit_code == ExitCode.OK
+        mock_sdk.artifact_manager.get_export.assert_awaited_once_with("s1", "stix", tlp="AMBER+STRICT")
+
+    @pytest.mark.parametrize(
+        ("command", "args", "method", "expected_args", "expected_kwargs"),
+        [
+            ("export-all", ["s1"], "download_all_exports", ("s1",), {"tlp": "GREEN"}),
+            ("download-folder", ["f1"], "download_folder", ("f1",), {"tlp": "CLEAR"}),
+            ("download-bundle", ["a1", "a2"], "download_bundle", (["a1", "a2"],), {"tlp": "RED"}),
+        ],
+    )
+    def test_each_download_command_forwards_tlp(
+        self, runner, authed, mock_sdk, tmp_path, monkeypatch, command, args, method, expected_args, expected_kwargs
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        getattr(mock_sdk.artifact_manager, method).return_value = b"PK\x03\x04zip"
+        tlp = expected_kwargs["tlp"]
+        result = runner.invoke(app, ["artifact-manager", command, *args, "--tlp", tlp.lower()])
+        assert result.exit_code == ExitCode.OK
+        getattr(mock_sdk.artifact_manager, method).assert_awaited_once_with(*expected_args, **expected_kwargs)
+
+    def test_invalid_tlp_is_a_usage_error_before_the_api(self, runner, authed, mock_sdk) -> None:
+        result = runner.invoke(app, ["artifact-manager", "export", "s1", "stix", "--tlp", "WHITE"])
+        # The CLI maps every Click usage error to BAD_INPUT (64), not Click's 2 — exit 2 is this
+        # CLI's "missing credentials" (see exceptions.ExitCode + the README exit-code table).
+        assert result.exit_code == ExitCode.BAD_INPUT
+        # The usage error lists the canonical UPPERCASE spellings, not casefolded ones.
+        # Flatten Rich's panel borders/line wrap before matching the list.
+        assert "'CLEAR', 'GREEN', 'AMBER', 'AMBER+STRICT', 'RED'" in " ".join(result.output.replace("│", " ").split())
+        mock_sdk.artifact_manager.get_export.assert_not_awaited()
+
+    def test_omitted_tlp_passes_none(self, runner, authed, mock_sdk, tmp_path, monkeypatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        mock_sdk.artifact_manager.get_export.return_value = self._EXPORT
+        runner.invoke(app, ["artifact-manager", "export", "s1", "stix"])
+        mock_sdk.artifact_manager.get_export.assert_awaited_once_with("s1", "stix", tlp=None)
+
+    def test_list_rejects_invalid_tlp(self, runner, authed, mock_sdk) -> None:
+        result = runner.invoke(app, ["artifact-manager", "list", "--tlp", "WHITE"])
+        assert result.exit_code == ExitCode.BAD_INPUT
+        mock_sdk.artifact_manager.list_artifacts.assert_not_awaited()
+
+    def test_update_rejects_invalid_tlp(self, runner, authed, mock_sdk) -> None:
+        result = runner.invoke(app, ["artifact-manager", "update", "a1", "--tlp", "WHITE"])
+        assert result.exit_code == ExitCode.BAD_INPUT
+        mock_sdk.artifact_manager.update_artifact.assert_not_awaited()

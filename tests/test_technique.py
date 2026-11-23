@@ -51,7 +51,7 @@ def test_technique_happy_path_table(
     assert result.exit_code == 0, result.stdout + result.stderr
     assert "T1190" in result.stdout
     mock_sdk.enrich_technique_full.assert_awaited_once_with(
-        ["T1190"], framework="enterprise", include=[*presets.TECHNIQUE_FULL, "cves"]
+        ["T1190"], framework="enterprise", include=[*presets.TECHNIQUE_FULL, "cves"], asset_id=None
     )
 
 
@@ -65,8 +65,47 @@ def test_technique_framework_flag(
 
     assert result.exit_code == 0, result.stdout + result.stderr
     mock_sdk.enrich_technique_full.assert_awaited_once_with(
-        ["T0866"], framework="ics", include=[*presets.TECHNIQUE_FULL, "cves"]
+        ["T0866"], framework="ics", include=[*presets.TECHNIQUE_FULL, "cves"], asset_id=None
     )
+
+
+def test_technique_asset_lookup_ics(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, clean_env: Path, mock_sdk
+) -> None:
+    """``--asset-id`` names an ICS asset instead of a technique — the technique id is left out."""
+    monkeypatch.setenv("CRIMSON_CRAWLER_API_KEY", "test-key-1234")
+    mock_sdk.enrich_technique_full.return_value = _stub({"techniques": []})
+
+    result = runner.invoke(app, ["enrich", "technique", "--asset-id", "A0002", "--framework", "ics"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    mock_sdk.enrich_technique_full.assert_awaited_once_with(
+        None, framework="ics", include=[*presets.TECHNIQUE_FULL, "cves"], asset_id="A0002"
+    )
+
+
+def test_technique_asset_lookup_requires_ics_framework(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, clean_env: Path, mock_sdk
+) -> None:
+    """An ICS asset is only meaningful on the ICS matrix — refusing locally costs no usage."""
+    monkeypatch.setenv("CRIMSON_CRAWLER_API_KEY", "test-key-1234")
+
+    result = runner.invoke(app, ["enrich", "technique", "--asset-id", "A0002"])
+
+    assert result.exit_code == int(ExitCode.BAD_INPUT)
+    assert "--framework ics" in result.stdout + result.stderr
+    mock_sdk.enrich_technique_full.assert_not_awaited()
+
+
+def test_technique_rejects_asset_and_id_together(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, clean_env: Path, mock_sdk
+) -> None:
+    monkeypatch.setenv("CRIMSON_CRAWLER_API_KEY", "test-key-1234")
+
+    result = runner.invoke(app, ["enrich", "technique", "T1190", "--asset-id", "A0002", "--framework", "ics"])
+
+    assert result.exit_code == int(ExitCode.BAD_INPUT)
+    mock_sdk.enrich_technique_full.assert_not_awaited()
 
 
 def test_technique_json(runner: CliRunner, monkeypatch: pytest.MonkeyPatch, clean_env: Path, mock_sdk) -> None:
@@ -136,5 +175,5 @@ def test_technique_renamed_command_enriches_seeded_technique(
 
     assert result.exit_code == 0, result.stdout + result.stderr
     mock_sdk.enrich_technique_full.assert_awaited_once_with(
-        ["T1059"], framework="enterprise", include=[*presets.TECHNIQUE_FULL, "cves"]
+        ["T1059"], framework="enterprise", include=[*presets.TECHNIQUE_FULL, "cves"], asset_id=None
     )

@@ -140,6 +140,11 @@ def describe_api_status(status: int) -> str:
             f"{_key_origin_sentence()} The key may lack access to this endpoint, "
             "or your plan may not include it."
         )
+    if status == 402:
+        return (
+            "No AI key is available for this account (HTTP 402). Add an OpenAI-compatible API key "
+            "in the portal under API Dashboard → AI Provider, then retry."
+        )
     return f"Crimson Crawler API returned status {status}"
 
 
@@ -168,7 +173,33 @@ class APIError(CLIError):
     def __init__(self, status: int, body: dict[str, Any] | str | None, message: str | None = None) -> None:
         self.status = status
         self.body = body
-        super().__init__(message or describe_api_status(status))
+        super().__init__(message or _with_server_reason(describe_api_status(status), status, body))
+
+
+def _with_server_reason(summary: str, status: int, body: dict[str, Any] | str | None) -> str:
+    """Append the server's own one-line reason (``error`` / ``detail`` / ``message``) to ``summary``.
+
+    Without it a rejected request printed only ``returned status 400``, so a human never saw WHY
+    (``daily_report requires monitoring``, ``no asset matches that product``); the reason reached
+    ``--json`` output only. 401/402/403 keep their tailored guidance alone: their bodies are gateway
+    boilerplate. Collapsed to one line and capped so a large body can't flood the terminal.
+    """
+    if status in (401, 402, 403) or not isinstance(body, dict):
+        return summary
+    reason = next(
+        (body[k] for k in ("error", "detail", "message") if isinstance(body.get(k), str) and body[k].strip()), None
+    )
+    if reason is None and isinstance(body.get("detail"), dict):
+        nested = body["detail"].get("error")
+        reason = nested if isinstance(nested, str) and nested.strip() else None
+        if (status, reason) == (409, "snapshot_expired"):
+            return f"{summary}: Snapshot expired. Restart the walk without a cursor."
+        if (status, reason) == (503, "snapshot_unavailable"):
+            return f"{summary}: Snapshot storage is unavailable. Retry later."
+    if reason is None:
+        return summary
+    one_line = " ".join(reason.split())
+    return f"{summary}: {one_line[:300]}{'…' if len(one_line) > 300 else ''}"
 
 
 def _decode_unexpected_body(raw: Any) -> dict[str, Any] | str | None:

@@ -25,6 +25,7 @@ from rich.table import Table
 from .. import auth, output, paths
 from ..client_factory import build_client
 from ..exceptions import BadInputError, handle_errors
+from ..tlp import tlp_option, tlp_value
 from ._formatters import with_status
 
 app = typer.Typer(
@@ -115,11 +116,13 @@ def _render_reports(console: Console, payload: dict[str, Any]) -> None:
     table = Table(title=f"Reports ({len(reports)})")
     table.add_column("ID", overflow="fold")
     table.add_column("Name", overflow="fold")
+    table.add_column("TLP")
     table.add_column("Created", overflow="fold")
     for r in reports:
         table.add_row(
             escape(str(r.get("id", ""))),
             escape(str(r.get("name", ""))),
+            escape(str(r.get("tlp", ""))),
             escape(str(r.get("created_at", r.get("createdAt", "")))),
         )
     console.print(table)
@@ -173,6 +176,13 @@ def create_command(
         typer.Option("--source", "-s", help="Saved artifact id to ground on (repeatable)."),
     ] = None,
     name: Annotated[str | None, typer.Option("--name", help="Optional report name.")] = None,
+    tlp: Annotated[
+        str | None,
+        tlp_option(
+            "TLP 2.0 marking stored on the report as given "
+            "(default: your default report TLP, raised to the most restrictive source marking)."
+        ),
+    ] = None,
     _json: output.JsonFlag = False,
     _expand: output.ExpandFlag = False,
 ) -> None:
@@ -181,13 +191,16 @@ def create_command(
 
     async def _call() -> dict[str, Any]:
         async with build_client(resolved) as client:
-            return await client.ai_reports.create_draft(template, source_ids=source or None, name=name)
+            return await client.ai_reports.create_draft(
+                template, source_ids=source or None, name=name, tlp=tlp_value(tlp)
+            )
 
     payload = with_status("Creating draft…", _call())
     output.render(
         payload,
         lambda c, p: c.print(
-            f"[green]Draft created[/green] {escape(str(p.get('id', '')))} — "
+            f"[green]Draft created[/green] {escape(str(p.get('id', '')))} "
+            f"[dim]TLP:{escape(str(p.get('tlp') or '—'))}[/dim] — "
             f"[dim]{len(p.get('ai_sections') or [])} AI section(s) to fill "
             f"(use `ccc reports generate` to do it in one shot)[/dim]"
         ),
@@ -203,6 +216,13 @@ def generate_command(
         typer.Option("--source", "-s", help="Saved artifact id to ground on (repeatable)."),
     ] = None,
     name: Annotated[str | None, typer.Option("--name", help="Optional report name.")] = None,
+    tlp: Annotated[
+        str | None,
+        tlp_option(
+            "TLP 2.0 marking stored on the report as given "
+            "(default: your default report TLP, raised to the most restrictive source marking)."
+        ),
+    ] = None,
     _json: output.JsonFlag = False,
     _expand: output.ExpandFlag = False,
 ) -> None:
@@ -212,7 +232,9 @@ def generate_command(
 
     async def _call() -> dict[str, Any]:
         async with build_client(resolved) as client:
-            return await client.ai_reports.generate_report(template, source_ids=source or None, name=name)
+            return await client.ai_reports.generate_report(
+                template, source_ids=source or None, name=name, tlp=tlp_value(tlp)
+            )
 
     payload = with_status("Generating report…", _call())
 
@@ -220,11 +242,35 @@ def generate_command(
         report = p.get("report") or {}
         sections = p.get("sections") or []
         skipped = p.get("skipped") or []
-        console.print(
-            f"[green]Report generated[/green] {escape(str(report.get('id', '')))} "
-            f"([dim]{escape(str(report.get('name', '')))}[/dim])"
-        )
-        console.print(f"[dim]{len(sections)} AI section(s) filled[/dim]")
+        # The SDK's fill loop records a STOP as a section entry (`{"error": ..., "status": ...}`) rather
+        # than raising, so the partial report survives. Counting those as "filled" reported an incomplete
+        # report as a plain success — the failure mode a spent daily allowance or missing key makes routine.
+        stop = next((s for s in sections if isinstance(s, dict) and s.get("error")), None)
+        filled = [s for s in sections if not (isinstance(s, dict) and s.get("error"))]
+        head = "[yellow]Report generated (incomplete)[/yellow]" if stop else "[green]Report generated[/green]"
+        console.print(f"{head} {escape(str(report.get('id', '')))} ([dim]{escape(str(report.get('name', '')))}[/dim])")
+        if report.get("tlp"):
+            console.print(f"[dim]TLP:{escape(str(report['tlp']))}[/dim]")
+        console.print(f"[dim]{len(filled)} AI section(s) filled[/dim]")
+        if stop:
+            status = stop.get("status")
+            reasons: dict[int, str] = {
+                402: "no AI key available. Add an OpenAI-compatible key under API Dashboard → AI Provider",
+                429: "API rate limit reached. Wait a minute and retry",
+            }
+            fallback = str(stop.get("error") or "generation failed")
+            if stop.get("error") == "quota exhausted":
+                reason = (
+                    "today's built-in AI allowance is used up. Add your own AI key under API Dashboard → "
+                    "AI Provider for no limit, or wait for the 00:00 UTC reset"
+                )
+            else:
+                reason = reasons.get(status, fallback) if isinstance(status, int) else fallback
+            console.print(f"[yellow]Generation stopped early: {escape(reason)}[/yellow]")
+            console.print(
+                f"[dim]The remaining sections are unfilled — finish them with "
+                f"`ccc reports fill {escape(str(report.get('id', '')))}`.[/dim]"
+            )
         if skipped:
             joined = escape(", ".join(map(str, skipped)))
             console.print(f"[yellow]{len(skipped)} source id(s) skipped (unresolved): {joined}[/yellow]")
@@ -336,6 +382,13 @@ def export_command(
         Path | None,
         typer.Option("--output", "-o", help="Write the export to a file instead of stdout."),
     ] = None,
+    tlp: Annotated[
+        str | None,
+        tlp_option(
+            "TLP 2.0 marking written into the document, overriding the report's stored TLP "
+            "(default: the report's stored TLP)."
+        ),
+    ] = None,
     _json: output.JsonFlag = False,
     _expand: output.ExpandFlag = False,
 ) -> None:
@@ -347,7 +400,7 @@ def export_command(
 
     async def _call() -> dict[str, Any]:
         async with build_client(resolved) as client:
-            return await client.ai_reports.export_report(report_id, fmt.value)
+            return await client.ai_reports.export_report(report_id, fmt.value, tlp=tlp_value(tlp))
 
     payload = with_status("Exporting report…", _call())
     content = str(payload.get("content", ""))

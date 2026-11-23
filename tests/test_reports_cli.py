@@ -55,11 +55,12 @@ class TestTemplatesAndList:
 
     def test_lists_reports(self, runner, authed, mock_sdk) -> None:
         mock_sdk.ai_reports.list_reports.return_value = [
-            {"id": "r1", "name": "Q3 brief", "created_at": "2026-06-20"},
+            {"id": "r1", "name": "Q3 brief", "tlp": "GREEN", "created_at": "2026-06-20"},
         ]
         result = runner.invoke(app, ["reports", "list"])
         assert result.exit_code == ExitCode.OK
         assert "Q3 brief" in result.output
+        assert "GREEN" in result.output  # the TLP column
 
     def test_empty_reports(self, runner, authed, mock_sdk) -> None:
         mock_sdk.ai_reports.list_reports.return_value = []
@@ -100,13 +101,29 @@ class TestCreateAndGenerate:
         result = runner.invoke(app, ["reports", "create", "exec", "-s", "s1", "-s", "s2", "--name", "Brief"])
         assert result.exit_code == ExitCode.OK
         assert "r9" in result.output
-        mock_sdk.ai_reports.create_draft.assert_awaited_once_with("exec", source_ids=["s1", "s2"], name="Brief")
+        mock_sdk.ai_reports.create_draft.assert_awaited_once_with(
+            "exec", source_ids=["s1", "s2"], name="Brief", tlp=None
+        )
 
     def test_create_minimal(self, runner, authed, mock_sdk) -> None:
         mock_sdk.ai_reports.create_draft.return_value = {"id": "r9", "ai_sections": []}
         result = runner.invoke(app, ["reports", "create", "technical"])
         assert result.exit_code == ExitCode.OK
-        mock_sdk.ai_reports.create_draft.assert_awaited_once_with("technical", source_ids=None, name=None)
+        mock_sdk.ai_reports.create_draft.assert_awaited_once_with("technical", source_ids=None, name=None, tlp=None)
+
+    def test_create_forwards_tlp_canonicalised_and_shows_the_stored_marking(self, runner, authed, mock_sdk) -> None:
+        mock_sdk.ai_reports.create_draft.return_value = {"id": "r9", "ai_sections": [], "tlp": "AMBER+STRICT"}
+        result = runner.invoke(app, ["reports", "create", "exec", "--tlp", "amber+strict"])
+        assert result.exit_code == ExitCode.OK
+        assert "TLP:AMBER+STRICT" in result.output
+        mock_sdk.ai_reports.create_draft.assert_awaited_once_with(
+            "exec", source_ids=None, name=None, tlp="AMBER+STRICT"
+        )
+
+    def test_create_invalid_tlp_is_a_usage_error_before_the_api(self, runner, authed, mock_sdk) -> None:
+        result = runner.invoke(app, ["reports", "create", "exec", "--tlp", "WHITE"])
+        assert result.exit_code == ExitCode.BAD_INPUT
+        mock_sdk.ai_reports.create_draft.assert_not_awaited()
 
     def test_generate(self, runner, authed, mock_sdk) -> None:
         mock_sdk.ai_reports.generate_report.return_value = {
@@ -118,7 +135,18 @@ class TestCreateAndGenerate:
         assert result.exit_code == ExitCode.OK
         assert "r9" in result.output
         assert "2 AI section" in result.output
-        mock_sdk.ai_reports.generate_report.assert_awaited_once_with("exec", source_ids=["s1"], name=None)
+        mock_sdk.ai_reports.generate_report.assert_awaited_once_with("exec", source_ids=["s1"], name=None, tlp=None)
+
+    def test_generate_forwards_tlp_and_prints_the_report_marking(self, runner, authed, mock_sdk) -> None:
+        mock_sdk.ai_reports.generate_report.return_value = {
+            "report": {"id": "r9", "name": "Brief", "tlp": "RED"},
+            "sections": [],
+            "skipped": [],
+        }
+        result = runner.invoke(app, ["reports", "generate", "exec", "--tlp", "red"])
+        assert result.exit_code == ExitCode.OK
+        assert "TLP:RED" in result.output
+        mock_sdk.ai_reports.generate_report.assert_awaited_once_with("exec", source_ids=None, name=None, tlp="RED")
 
     def test_generate_reports_skipped(self, runner, authed, mock_sdk) -> None:
         mock_sdk.ai_reports.generate_report.return_value = {
@@ -129,6 +157,47 @@ class TestCreateAndGenerate:
         result = runner.invoke(app, ["reports", "generate", "exec"])
         assert result.exit_code == ExitCode.OK
         assert "bad-id" in result.output
+
+    def test_generate_quota_stop_names_the_own_key_way_out(self, runner, authed, mock_sdk) -> None:
+        """A spent built-in-AI allowance reads as that, with the own-key and reset fixes, not as a rate limit."""
+        mock_sdk.ai_reports.generate_report.return_value = {
+            "report": {"id": "r9", "name": "Brief"},
+            "sections": [{"section_type": "a"}, {"error": "quota exhausted", "status": 429}],
+            "skipped": [],
+        }
+        result = runner.invoke(app, ["reports", "generate", "exec"])
+        assert result.exit_code == ExitCode.OK
+        assert "incomplete" in result.output
+        assert "built-in AI allowance" in result.output
+        assert "00:00 UTC" in result.output
+        assert "rate limit" not in result.output
+
+    def test_generate_no_ai_provider_stop_is_reported_not_counted_as_filled(self, runner, authed, mock_sdk) -> None:
+        """Bring-your-own-key: the SDK records a 402 stop as a section entry so the partial report
+        survives. Counting it as filled would report an incomplete report as a plain success."""
+        mock_sdk.ai_reports.generate_report.return_value = {
+            "report": {"id": "r9", "name": "Brief"},
+            "sections": [{"section_type": "a"}, {"error": "no AI provider", "status": 402}],
+            "skipped": [],
+        }
+        result = runner.invoke(app, ["reports", "generate", "exec"])
+        assert result.exit_code == ExitCode.OK
+        assert "incomplete" in result.output
+        assert "1 AI section" in result.output  # the stop entry is NOT counted as filled
+        assert "Dashboard" in result.output and "AI Provider" in result.output  # how to fix it
+        assert "reports fill r9" in result.output  # and how to finish it
+
+    def test_generate_502_stop_reports_the_copilot_reason(self, runner, authed, mock_sdk) -> None:
+        mock_sdk.ai_reports.generate_report.return_value = {
+            "report": {"id": "r9"},
+            "sections": [{"error": "generation failed", "status": 502}],
+            "skipped": [],
+        }
+        result = runner.invoke(app, ["reports", "generate", "exec"])
+        assert result.exit_code == ExitCode.OK
+        assert "incomplete" in result.output
+        assert "0 AI section" in result.output
+        assert "generation failed" in result.output
 
     def test_generate_json(self, runner, authed, mock_sdk) -> None:
         mock_sdk.ai_reports.generate_report.return_value = {"report": {"id": "r9"}, "sections": [], "skipped": []}
@@ -262,12 +331,26 @@ class TestExport:
         result = runner.invoke(app, ["reports", "export", "r1", "--format", "md"])
         assert result.exit_code == ExitCode.OK
         assert "# Report" in result.output
-        mock_sdk.ai_reports.export_report.assert_awaited_once_with("r1", "md")
+        mock_sdk.ai_reports.export_report.assert_awaited_once_with("r1", "md", tlp=None)
 
     def test_export_default_html(self, runner, authed, mock_sdk) -> None:
         mock_sdk.ai_reports.export_report.return_value = {"content": "<h1/>", "filename": "r1.html"}
         runner.invoke(app, ["reports", "export", "r1"])
-        mock_sdk.ai_reports.export_report.assert_awaited_once_with("r1", "html")
+        mock_sdk.ai_reports.export_report.assert_awaited_once_with("r1", "html", tlp=None)
+
+    def test_export_forwards_tlp_canonicalised(self, runner, authed, mock_sdk) -> None:
+        mock_sdk.ai_reports.export_report.return_value = {"content": "# R", "filename": "r1.md"}
+        result = runner.invoke(app, ["reports", "export", "r1", "-f", "md", "--tlp", "red"])
+        assert result.exit_code == ExitCode.OK
+        mock_sdk.ai_reports.export_report.assert_awaited_once_with("r1", "md", tlp="RED")
+
+    def test_export_invalid_tlp_is_a_usage_error_before_the_api(self, runner, authed, mock_sdk) -> None:
+        result = runner.invoke(app, ["reports", "export", "r1", "--tlp", "TLP:RED"])
+        assert result.exit_code == ExitCode.BAD_INPUT  # usage errors are 64 here, not Click's 2
+        # The usage error lists the canonical UPPERCASE spellings, not casefolded ones.
+        # Flatten Rich's panel borders/line wrap before matching the list.
+        assert "'CLEAR', 'GREEN', 'AMBER', 'AMBER+STRICT', 'RED'" in " ".join(result.output.replace("│", " ").split())
+        mock_sdk.ai_reports.export_report.assert_not_awaited()
 
     def test_export_to_file(self, runner, authed, mock_sdk, tmp_path) -> None:
         mock_sdk.ai_reports.export_report.return_value = {"content": "# Report\n", "filename": "r1.md"}

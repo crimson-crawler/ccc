@@ -9,6 +9,7 @@ plain ``str`` parameter, so no source pattern can match it. See
 from __future__ import annotations
 
 import json
+import sys
 
 import pytest
 from rich.console import Console
@@ -52,3 +53,19 @@ def test_render_error_json_mode_is_unaffected(capsys: pytest.CaptureFixture[str]
     output.render_error({"error": "APIError", "message": "[red]x[/red]"}, "[red]x[/red]")
     parsed = json.loads(capsys.readouterr().err)
     assert parsed["message"] == "[red]x[/red]"
+
+
+@pytest.mark.parametrize("interactive", [True, False], ids=["tty", "not-tty"])
+def test_stdout_is_tty_reflects_the_underlying_stream(monkeypatch: pytest.MonkeyPatch, interactive: bool) -> None:
+    """The destination switch reads ``sys.stdout.isatty()`` at call time.
+
+    Reading it live (rather than caching a module-level `Console`) is what makes it
+    monkeypatchable at all — Typer's ``CliRunner`` swaps ``sys.stdout`` during ``invoke``.
+    """
+
+    class _Stub:
+        def isatty(self) -> bool:
+            return interactive
+
+    monkeypatch.setattr(sys, "stdout", _Stub())
+    assert output.stdout_is_tty() is interactive

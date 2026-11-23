@@ -16,6 +16,7 @@ import pytest
 from typer.testing import CliRunner
 
 from crimson_crawler_cli.cli import app
+from crimson_crawler_cli.commands import _includes
 from crimson_crawler_cli.exceptions import ExitCode
 from crimson_crawler_client import UnexpectedStatus
 
@@ -31,9 +32,60 @@ def _stub_response(payload: dict) -> MagicMock:
     return response
 
 
+@pytest.mark.parametrize(
+    ("command", "family"),
+    [
+        ("group-exposure", "ASSESS_GROUP"),
+        ("ioc-portfolio", "ASSESS_IOC"),
+        ("technique-coverage", "ASSESS_TECHNIQUE"),
+        ("vulnerability-exposure", "ASSESS_VULN"),
+    ],
+)
+def test_assessment_help_matches_include_contract(runner: CliRunner, command: str, family: str) -> None:
+    result = runner.invoke(app, ["assess", command, "--help"])
+    assert result.exit_code == 0, result.output
+    text = " ".join(result.output.replace("│", " ").split())
+    accepted = text.split("Options: ", 1)[1].split(".", 1)[0].split(", ")
+    defaults = text.split("Defaults: ", 1)[1].split(".", 1)[0].split(", ")
+    assert set(accepted) == set(getattr(_includes, f"{family}_INCLUDES"))
+    assert defaults == list(getattr(_includes, f"{family}_DEFAULTS"))
+
+
+def test_group_exposure_collects_technique_pages(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, clean_env: Path, mock_sdk
+) -> None:
+    monkeypatch.setenv("CRIMSON_CRAWLER_API_KEY", "test-key-1234")
+    mock_sdk.assess_group_exposure.side_effect = [
+        _stub_response(
+            {
+                "snapshot_id": "a" * 32,
+                "techniques": [{"technique_id": "T0001"}],
+                "techniques_next_offset": 10,
+                "errors": [],
+            }
+        ),
+        _stub_response(
+            {
+                "snapshot_id": "a" * 32,
+                "techniques": [{"technique_id": "T0002"}],
+                "techniques_next_offset": None,
+                "errors": [],
+            }
+        ),
+    ]
+    result = runner.invoke(app, ["--json", "assess", "group-exposure", "--group-id", "G0016"])
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert [row["technique_id"] for row in payload["techniques"]] == ["T0001", "T0002"]
+
+
 # -- ccc assess group-exposure -------------------------------------------------- #
 
 _GROUP_EXPOSURE = {
+    "snapshot_id": "a" * 32,
+    "techniques_next_offset": None,
+    "log_source_catalog": [],
+    "log_source_refs": {},
     "groups": [{"group_id": "G0016", "name": "APT29"}, {"group_id": "G0007", "name": "APT28"}],
     "techniques": [{"technique_id": "T1566", "name": "Phishing", "tactics": ["initial-access"]}],
     "overlap_analysis": {
@@ -379,7 +431,7 @@ def test_technique_coverage_requires_at_least_one_id(
 # -- ccc assess vulnerability-exposure ------------------------------------------ #
 
 _EXPOSURE = {
-    "cves": [{"cve_id": "CVE-2000-0001", "cvss_score": 9.8}],
+    "cves": [{"cve_id": "CVE-2000-0001", "cvss_v3_score": 9.8}],
     "kev_entries": [{"cve_id": "CVE-2000-0001"}],
     "max_weaponization_score": 91,
     "avg_weaponization_score": 74,
@@ -473,6 +525,138 @@ def test_vulnerability_exposure_json_round_trip(
     assert result.exit_code == 0, result.stdout + result.stderr
     assert json.loads(result.stdout) == _EXPOSURE
     assert mock_sdk.assess_vulnerability_exposure.call_args.args == (["CVE-2000-0001"],)
+
+
+_SNAPSHOT = "c" * 32
+
+
+def _exposure_page(ids: list[str], *, next_offset: int | None, total: int, first: bool = False) -> MagicMock:
+    payload = {
+        "osv_advisories": [{"id": identifier} for identifier in ids],
+        "osv_advisories_total": total,
+        "osv_advisories_truncated": next_offset is not None,
+        "osv_next_offset": next_offset,
+        "osv_snapshot_id": _SNAPSHOT if next_offset is not None else None,
+        "errors": [],
+    }
+    return _stub_response({**json.loads(json.dumps(_EXPOSURE)), **payload} if first else payload)
+
+
+def test_vulnerability_exposure_follows_osv_cursor_with_identical_request(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, clean_env: Path, mock_sdk
+) -> None:
+    monkeypatch.setenv("CRIMSON_CRAWLER_API_KEY", "test-key-1234")
+    mock_sdk.assess_vulnerability_exposure.side_effect = [
+        _exposure_page(["GHSA-1", "GHSA-2"], next_offset=2, total=3, first=True),
+        _exposure_page(["GHSA-3"], next_offset=None, total=3),
+    ]
+
+    result = runner.invoke(
+        app,
+        [
+            "--json",
+            "assess",
+            "vulnerability-exposure",
+            "CVE-2000-0001",
+            "CVE-2000-0002",
+            "--stakeholder",
+            "exposure=open",
+            "--include",
+            "osv_restricted",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    data = json.loads(result.stdout)
+    assert data["cves"] == _EXPOSURE["cves"]
+    assert [row["id"] for row in data["osv_advisories"]] == ["GHSA-1", "GHSA-2", "GHSA-3"]
+    assert data["osv_advisories_truncated"] is False
+    assert "osv_next_offset" not in data and "osv_snapshot_id" not in data
+    calls = mock_sdk.assess_vulnerability_exposure.await_args_list
+    assert [(c.kwargs["osv_offset"], c.kwargs["osv_snapshot_id"]) for c in calls] == [(0, None), (2, _SNAPSHOT)]
+    for call in calls:
+        assert call.args == (["CVE-2000-0001", "CVE-2000-0002"],)
+        assert call.kwargs["include"] == ["osv_restricted"]
+        assert call.kwargs["stakeholder"] == {"exposure": "open"}
+
+
+def test_vulnerability_exposure_osv_walk_over_max_bytes_prints_nothing(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, clean_env: Path, mock_sdk
+) -> None:
+    monkeypatch.setenv("CRIMSON_CRAWLER_API_KEY", "test-key-1234")
+    mock_sdk.assess_vulnerability_exposure.side_effect = [
+        _exposure_page(["GHSA-1"], next_offset=1, total=2, first=True),
+        _exposure_page(["GHSA-2" + "x" * 2000], next_offset=None, total=2),
+    ]
+
+    result = runner.invoke(app, ["--json", "assess", "vulnerability-exposure", "CVE-2000-0001", "--max-bytes", "1500"])
+
+    assert result.exit_code != 0
+    assert result.stdout == ""
+    assert "osv_walk_too_large" in result.stderr
+
+
+def test_vulnerability_exposure_unavailable_osv_snapshot_exits_with_retry_guidance(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, clean_env: Path, mock_sdk
+) -> None:
+    monkeypatch.setenv("CRIMSON_CRAWLER_API_KEY", "test-key-1234")
+    mock_sdk.assess_vulnerability_exposure.side_effect = [
+        _exposure_page(["GHSA-1"], next_offset=1, total=2, first=True),
+        UnexpectedStatus(503, b'{"detail":{"error":"snapshot_unavailable"}}', None),
+    ]
+
+    result = runner.invoke(app, ["assess", "vulnerability-exposure", "CVE-2000-0001"])
+
+    assert result.exit_code == int(ExitCode.API_ERROR)
+    assert result.stdout == ""
+    assert "Snapshot storage is unavailable" in result.stderr
+
+
+def test_vulnerability_exposure_renders_osv_rows_and_incomplete_note(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, clean_env: Path, mock_sdk
+) -> None:
+    monkeypatch.setenv("CRIMSON_CRAWLER_API_KEY", "test-key-1234")
+    page = _exposure_page(["GHSA-1"], next_offset=None, total=2, first=True)
+    page.to_dict.return_value["osv_advisories_truncated"] = True
+    mock_sdk.assess_vulnerability_exposure.return_value = page
+
+    result = runner.invoke(app, ["assess", "vulnerability-exposure", "CVE-2000-0001"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert "GHSA-1" in result.stdout
+    assert "OSV advisories incomplete: 1 of 2 shown" in result.stdout.replace("\n", " ")
+
+
+def test_vulnerability_exposure_renders_osv_rows_when_no_cve_resolved(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, clean_env: Path, mock_sdk
+) -> None:
+    monkeypatch.setenv("CRIMSON_CRAWLER_API_KEY", "test-key-1234")
+    page = _exposure_page(["GHSA-1"], next_offset=None, total=1, first=True)
+    page.to_dict.return_value["cves"] = []
+    mock_sdk.assess_vulnerability_exposure.return_value = page
+
+    result = runner.invoke(app, ["assess", "vulnerability-exposure", "CVE-2000-0001"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert "GHSA-1" in result.stdout
+    assert "No data found for these CVEs" in result.stdout
+
+
+def test_osv_note_does_not_claim_errors_for_a_compact_row(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, clean_env: Path, mock_sdk
+) -> None:
+    monkeypatch.setenv("CRIMSON_CRAWLER_API_KEY", "test-key-1234")
+    page = _exposure_page(["GHSA-1"], next_offset=None, total=1, first=True)
+    page.to_dict.return_value["osv_advisories_truncated"] = True
+    mock_sdk.assess_vulnerability_exposure.return_value = page
+
+    result = runner.invoke(app, ["assess", "vulnerability-exposure", "CVE-2000-0001"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    text = result.stdout.replace("\n", " ")
+    assert "OSV advisories incomplete: 1 of 1 shown" in text
+    assert "some rows are compact or unreadable" in text
+    assert "listed in errors" not in text
 
 
 # -- shared error paths --------------------------------------------------------- #

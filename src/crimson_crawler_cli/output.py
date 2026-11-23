@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import sys
+import unicodedata
 from typing import Annotated, Any, Callable
 
 import typer
@@ -21,6 +22,7 @@ from rich.markup import escape
 _console = Console()
 _error_console = Console(stderr=True)
 _json_mode: bool = False
+_BIDI_CONTROLS = frozenset((0x061C, 0x200E, 0x200F, *range(0x202A, 0x202F), *range(0x2066, 0x206A)))
 _expand_mode: bool = False
 
 
@@ -108,6 +110,18 @@ def get_error_console() -> Console:
     return _error_console
 
 
+def stdout_is_tty() -> bool:
+    """Whether stdout is an interactive terminal (the destination-aware render switch).
+
+    Deliberately `sys.stdout.isatty()` and not Rich's `Console.is_terminal`: the latter
+    reports `True` whenever `FORCE_COLOR` is set, which would write unescaped plain text
+    into `ccc ingest nmap s.xml > out.md`. Reading `sys.stdout` at call time is also the
+    only stable monkeypatch seam — Typer's `CliRunner` replaces `sys.stdout` during
+    `invoke`, so a module-level capture would be wrong under test.
+    """
+    return sys.stdout.isatty()
+
+
 def render(payload: dict[str, Any], table_view: Callable[[Console, dict[str, Any]], None]) -> None:
     """Render ``payload`` as JSON or as a Rich table depending on global mode.
 
@@ -138,7 +152,12 @@ def render_error(payload: dict[str, Any], human_message: str) -> None:
         sys.stderr.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
         sys.stderr.flush()
     else:
-        _error_console.print(f"[red]Error:[/red] {escape(human_message)}")
+        safe_message = "".join(
+            " " if char in "\n\t" else char
+            for char in human_message
+            if char in "\n\t" or (unicodedata.category(char) != "Cc" and ord(char) not in _BIDI_CONTROLS)
+        )
+        _error_console.print(f"[red]Error:[/red] {escape(safe_message)}")
 
 
 __all__ = [
@@ -152,4 +171,5 @@ __all__ = [
     "render_error",
     "set_expand_mode",
     "set_json_mode",
+    "stdout_is_tty",
 ]

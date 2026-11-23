@@ -17,7 +17,11 @@ groupId, npm scope, deb/rpm distro). The full contract lives in
 Internal asset shape (collection-time, NOT the output)::
 
     {"category", "vendor", "product", "versions": [...], "notes",
-     "ecosystem"?, "namespace"?}
+     "ecosystem"?, "namespace"?, "requirements"?}
+
+``requirements`` maps a version to the constraint that was declared for it
+(``{"0.28.1": ">=0.28"}``) when a lockfile resolved a non-concrete spec, so
+the concrete component version can also carry ``crimson:requirement``.
 
 ``build_inventory`` is the boundary that turns deduped internal assets into a
 CycloneDX document; nothing outside this module sees the internal shape.
@@ -110,12 +114,23 @@ def _drop_redundant_unknown(versions: list[str]) -> list[str]:
 
 def split_versions(versions: list[str]) -> list[str]:
     """Split each spec on ``,``, resolve to concrete versions, dedup, and drop
-    ``'unknown'`` once any concrete version is known."""
+    ``'unknown'`` once any concrete version is known.
+
+    The comma split exists for multi-pin specs (``"1.0,2.0"`` → two concrete
+    versions). A PEP 508 *compound constraint* (``">=5.0,<6.0"``) also contains a
+    comma but describes ONE requirement, and splitting it produced one
+    unversioned component per half — the #360 duplication. When every part of a
+    spec is a constraint, the spec is kept whole so it yields exactly one entry;
+    ``crimson:requirement`` already carries the full text.
+    """
     out: list[str] = []
     for v in versions:
         text = v if isinstance(v, str) else str(v)  # tolerate int/float pins
-        for part in text.split(","):
-            cleaned = clean_version(part)
+        parts = [clean_version(p) for p in text.split(",")]
+        parts = [p for p in parts if p]
+        if parts and all(not is_concrete_version(p) and p != "unknown" for p in parts):
+            parts = [clean_version(text)]
+        for cleaned in parts:
             if cleaned and cleaned not in out:
                 out.append(cleaned)
     return _drop_redundant_unknown(out) or ["unknown"]
@@ -134,6 +149,7 @@ def asset(
     note: str,
     ecosystem: str | None = None,
     namespace: str | None = None,
+    requirement: str | None = None,
 ) -> dict:
     """Build one internal asset dict.
 
@@ -141,6 +157,9 @@ def asset(
     selects the purl type at serialization. ``namespace`` is an explicit purl
     namespace (used by ``endpoint`` for the deb/rpm distro); for Maven / npm /
     Go it is derived from ``product`` at serialization instead.
+    ``requirement`` is the declared (possibly non-concrete) constraint when a
+    version was resolved from a lockfile — it is preserved as a
+    ``crimson:requirement`` property alongside the concrete version.
     """
     cleaned = split_versions(versions) if versions else ["unknown"]
     d: dict = {
@@ -154,6 +173,11 @@ def asset(
         d["ecosystem"] = ecosystem
     if namespace is not None:
         d["namespace"] = namespace
+    if requirement is not None:
+        # Per-version so dedup merging the same product from several
+        # manifests (each possibly with its own constraint) never
+        # mislabels a sibling version's requirement.
+        d["requirements"] = {v: requirement for v in cleaned if v != "unknown"}
     return d
 
 
@@ -172,6 +196,7 @@ def dedup(assets: list[dict]) -> list[dict]:
     Key = tuple[str, str | None, str | None, str | None, str]
     by_key: dict[Key, dict] = {}
     notes_by_key: dict[Key, list[str]] = {}
+    reqs_by_key: dict[Key, dict[str, str]] = {}
     order: list[Key] = []
     for a in assets:
         eco = a.get("ecosystem")
@@ -192,10 +217,21 @@ def dedup(assets: list[dict]) -> list[dict]:
                 entry["namespace"] = ns
             by_key[key] = entry
             notes_by_key[key] = []
+            reqs_by_key[key] = {}
             order.append(key)
         for v in a["versions"]:
             if v not in by_key[key]["versions"]:
                 by_key[key]["versions"].append(v)
+        for v, req in (a.get("requirements") or {}).items():
+            # Several manifests may declare the same package with different
+            # constraints that one lock resolves to the same version; join
+            # them so no declared constraint is dropped. Identical strings
+            # (the same manifest shape repeated) stay single.
+            prev = reqs_by_key[key].get(v)
+            if prev is None:
+                reqs_by_key[key][v] = req
+            elif req not in prev.split("; "):
+                reqs_by_key[key][v] = f"{prev}; {req}"
         if a["notes"] and a["notes"] not in notes_by_key[key]:
             notes_by_key[key].append(a["notes"])
 
@@ -214,6 +250,12 @@ def dedup(assets: list[dict]) -> list[dict]:
                 for v in by_key[nk]["versions"]:
                     if v not in by_key[target]["versions"]:
                         by_key[target]["versions"].append(v)
+                for v, req in reqs_by_key[nk].items():
+                    prev = reqs_by_key[target].get(v)
+                    if prev is None:
+                        reqs_by_key[target][v] = req
+                    elif req not in prev.split("; "):
+                        reqs_by_key[target][v] = f"{prev}; {req}"
                 for note in notes_by_key[nk]:
                     if note not in notes_by_key[target]:
                         notes_by_key[target].append(note)
@@ -229,6 +271,8 @@ def dedup(assets: list[dict]) -> list[dict]:
         else:
             by_key[key]["notes"] = joined
         by_key[key]["versions"] = _drop_redundant_unknown(by_key[key]["versions"])
+        if reqs_by_key[key]:
+            by_key[key]["requirements"] = reqs_by_key[key]
     return [by_key[k] for k in order]
 
 
@@ -290,7 +334,9 @@ def _asset_to_components(a: dict) -> list[dict]:
     A constraint (``>=2.31``) or ``'unknown'`` version yields a component with
     no ``version`` field; the raw constraint is preserved in a
     ``crimson:requirement`` property so nothing is lost. Multiple concrete
-    versions yield one component each (proper SBOM shape).
+    versions yield one component each (proper SBOM shape). A version resolved
+    from a lockfile also keeps its declared constraint as
+    ``crimson:requirement`` (the lock only pins what the manifest declares).
     """
     ctype = _CATEGORY_TO_TYPE.get(a["category"], "application")
     eco = a.get("ecosystem")
@@ -298,6 +344,7 @@ def _asset_to_components(a: dict) -> list[dict]:
     namespace, name = _purl_coords(purl_type, a["product"], a.get("namespace"))
     vendor = a.get("vendor")
     notes = a.get("notes") or ""
+    requirements = a.get("requirements") or {}
 
     components: list[dict] = []
     for version in a["versions"]:
@@ -314,6 +361,8 @@ def _asset_to_components(a: dict) -> list[dict]:
         properties: list[dict] = []
         if not concrete and version != "unknown":
             properties.append({"name": "crimson:requirement", "value": version})
+        elif concrete and version in requirements:
+            properties.append({"name": "crimson:requirement", "value": requirements[version]})
         if notes:
             properties.append({"name": "crimson:notes", "value": notes})
         if properties:

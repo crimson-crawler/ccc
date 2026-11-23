@@ -81,7 +81,7 @@ def secure_config_file(clean_env: Path) -> Path:
 class _MockClient:
     """Stand-in for :class:`CrawlerClient` used in CLI command tests.
 
-    Carries every convenience method the CLI calls — the 33 ``/v1`` operations
+    Carries every convenience method the CLI calls — the 37 ``/v1`` operations
     plus the four Platform namespaces — each an :class:`AsyncMock`. A test sets
     the return value on the one method its command uses; the factory hands back
     this same instance, so the command's ``async with build_client(...) as
@@ -89,16 +89,20 @@ class _MockClient:
     """
 
     def __init__(self) -> None:
-        # The 33 /v1 convenience methods, mirroring PARITY-CONTRACT.local.md.
+        # Every /v1 convenience method the CLI calls — the 37 /v1 operations plus the
+        # ``search_techniques`` shortcut, which re-wraps ``search_cti`` (38 methods),
+        # mirroring PARITY-CONTRACT.local.md.
         for method in (
             "enrich_atlas_full",
             "enrich_batch",
             "enrich_campaign_full",
             "enrich_capec_full",
+            "enrich_cloak_full",
             "enrich_cve_full",
             "enrich_cwe_full",
             "enrich_defend_full",
             "enrich_disarm_full",
+            "enrich_f3_full",
             "enrich_group_full",
             "enrich_ioc_full",
             "enrich_location_full",
@@ -108,6 +112,7 @@ class _MockClient:
             "enrich_sector_full",
             "enrich_software_full",
             "enrich_technique_full",
+            "search_csaf",
             "search_cti",
             "search_cve",
             "search_d3fend",
@@ -125,11 +130,14 @@ class _MockClient:
             "artifact_enrich_status",
             "inventory_enrich",
             "inventory_enrich_status",
+            "event_enrich",
+            "event_enrich_status",
         ):
             setattr(self, method, AsyncMock())
-        # client.enricher namespace — the async Artifact Enricher engine (submit→poll).
+        # client.enricher namespace — the async enrichment engines (artifact submit→poll + event).
         self.enricher = MagicMock()
         self.enricher.enrich = AsyncMock()
+        self.enricher.enrich_event = AsyncMock()
         # client.artifact_manager namespace (library only) — each method an AsyncMock, mirroring ArtifactManagerAPI.
         self.artifact_manager = MagicMock()
         for method in (
@@ -147,6 +155,8 @@ class _MockClient:
             "download_bundle",
             "get_rating",
             "set_rating",
+            "get_enricher_settings",
+            "set_enricher_settings",
             "list_exports",
             "get_export",
             "download_all_exports",
@@ -167,6 +177,7 @@ class _MockClient:
             "get_inventory_context",
             "list_enrichments",
             "compare_enrichments",
+            "get_history",
             "create_inventory",
             "update_inventory",
             "delete_inventory",
@@ -213,6 +224,36 @@ class _MockClient:
         self.api = MagicMock()
         self.aclose = AsyncMock()
 
+    async def iter_product_cves(self, *args, **kwargs):
+        from crimson_crawler_client.client import CrawlerClient
+
+        async for page in CrawlerClient.iter_product_cves(self, *args, **kwargs):
+            yield page
+
+    async def iter_cve_osv_pages(self, *args, **kwargs):
+        from crimson_crawler_client.client import CrawlerClient
+
+        async for page in CrawlerClient.iter_cve_osv_pages(self, *args, **kwargs):
+            yield page
+
+    async def iter_vulnerability_exposure_osv_pages(self, *args, **kwargs):
+        from crimson_crawler_client.client import CrawlerClient
+
+        async for page in CrawlerClient.iter_vulnerability_exposure_osv_pages(self, *args, **kwargs):
+            yield page
+
+    async def iter_group_pages(self, *args, **kwargs):
+        from crimson_crawler_client.client import CrawlerClient
+
+        async for page in CrawlerClient.iter_group_pages(self, *args, **kwargs):
+            yield page
+
+    async def iter_group_exposure_pages(self, *args, **kwargs):
+        from crimson_crawler_client.client import CrawlerClient
+
+        async for page in CrawlerClient.iter_group_exposure_pages(self, *args, **kwargs):
+            yield page
+
     async def __aenter__(self) -> "_MockClient":
         return self
 
@@ -240,6 +281,7 @@ def mock_sdk(monkeypatch: pytest.MonkeyPatch) -> _MockClient:
         assess,
         enrich,
         enrich_artifact,
+        enrich_event,
         enrich_inventory,
         ingest,
         inventory_manager,
@@ -254,6 +296,7 @@ def mock_sdk(monkeypatch: pytest.MonkeyPatch) -> _MockClient:
         search,
         assess,
         enrich_artifact,
+        enrich_event,
         enrich_inventory,
         search_techniques,
         artifact_manager,

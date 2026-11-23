@@ -190,6 +190,7 @@ def test_artifact_manager_get_output_replaces_planted_symlink(
         "name": "notes.txt",
         "format": "paste",
         "mime": "text/plain",
+        "tlp": "AMBER",
         "content": "artifact body\n",
     }
     destination = tmp_path / "artifact.txt"

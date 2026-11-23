@@ -1,17 +1,17 @@
-"""The ``ccc enrich`` sub-app — all 17 enrichment endpoints.
+"""The ``ccc enrich`` sub-app — all 19 enrichment endpoints.
 
 Six single-target chains (``cve``, ``product``, ``package``, ``ioc``, ``cwe``,
-``technique``), nine knowledge-graph entities (``atlas``, ``campaign``,
-``capec``, ``defend``, ``disarm``, ``group``, ``location``, ``sector``,
-``software``), plus ``batch`` and ``poc-source``.
+``technique``), eleven knowledge-graph entities (``atlas``, ``campaign``,
+``capec``, ``cloak``, ``defend``, ``disarm``, ``f3``, ``group``, ``location``,
+``sector``, ``software``), plus ``batch`` and ``poc-source``.
 
 Each invokes a convenience method on :class:`CrawlerClient` — command code
 goes through the typed SDK wrappers only, never the raw escape hatch or the
 SDK's auto-built model package. Identifiers whose format is canonical (CVE,
-CWE, ATT&CK/DISARM technique, ATLAS, CAPEC, campaign, group, software, and the
-``poc-source`` repository URL) are validated against a local regex so
-malformed input exits ``64`` without a wasted network round trip; the
-slug-shaped id spaces (D3FEND, location, sector) are sent verbatim. The nine
+CWE, ATT&CK/DISARM technique, ATLAS, F3, CLOAK, CAPEC, campaign, group,
+software, and the ``poc-source`` repository URL) are validated against a local
+regex so malformed input exits ``64`` without a wasted network round trip; the
+slug-shaped id spaces (D3FEND, location, sector) are sent verbatim. The eleven
 entity commands take a direct id *or* ``--search TEXT``, exactly one. The
 product positional argument accepts ``vendor/product`` shorthand; explicit
 ``--vendor``/``--product``/``--version`` flags override any inference. IOC
@@ -34,8 +34,9 @@ from crimson_crawler_client import presets
 
 from .. import auth, output, paths
 from ..client_factory import build_client
-from ..exceptions import BadInputError, handle_errors
-from . import _formatters
+from ..exceptions import BadInputError, CLIError, handle_errors
+from . import _formatters, _includes
+from ._osv_walk import DEFAULT_MAX_BYTES, collect_osv_walk
 
 app = typer.Typer(
     name="enrich",
@@ -46,10 +47,27 @@ app = typer.Typer(
 _CVE_PATTERN = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
 _CWE_PATTERN = re.compile(r"^CWE-\d+$", re.IGNORECASE)
 _TECHNIQUE_PATTERN = re.compile(r"^T\d{4}(\.\d{3})?$", re.IGNORECASE)
+# The ICS corpus keys its asset classes ``Annnn`` (A0002 = Human-Machine Interface). An asset is a
+# lookup selector in its own right on /enrich/technique?framework=ics, not a filter over techniques.
+_ASSET_PATTERN = re.compile(r"^A\d{4}$", re.IGNORECASE)
 # DISARM numbers its influence-operation techniques in the same ``Tnnnn`` space
 # as ATT&CK, so the two share one pattern; only the error label differs.
 _DISARM_PATTERN = _TECHNIQUE_PATTERN
 _ATLAS_PATTERN = re.compile(r"^AML\.T\d{4}(\.\d{3})?$", re.IGNORECASE)
+# MITRE F3 numbers its own fraud techniques ``Fnnnn`` (plus ``.nnn`` sub-techniques) and, for
+# the 43 techniques it shares with Enterprise ATT&CK, borrows that real ``Tnnnn`` id — both
+# shapes are valid direct lookups, so one alternation covers them.
+_F3_PATTERN = re.compile(r"^(?:F\d{3,4}|T\d{4})(\.\d{3})?$", re.IGNORECASE)
+# CLOAK spans four id spaces in the live corpus (censused 2026-09-12 over 1,260 distinct external
+# ids): ``TTP-nnn`` tools (571), ``taN-teN[-stN]`` techniques (659), ``UL-ST-n[-stn]`` tactics (13),
+# ``TL-n`` tactics (3), bare ``taN`` tactics (13), plus the ``CLOAK`` matrix itself (1). All of them
+# are valid direct lookups, so the alternation covers every shape — a narrower pattern rejects a
+# real id locally with exit 64 without ever asking the API. Canonical casing differs per family
+# (``TTP-496``, ``ta6-te129``) and the API resolves either, so the match is case-insensitive.
+_CLOAK_PATTERN = re.compile(
+    r"^(?:TTP-\d{1,6}|UL-ST-\d{1,4}(?:-st\d{1,5})?|ta\d{1,3}-te\d{1,4}(?:-st\d{1,5})?|TL-\d{1,3}|ta\d{1,3}|CLOAK)$",
+    re.IGNORECASE,
+)
 _CAPEC_PATTERN = re.compile(r"^CAPEC-\d+$", re.IGNORECASE)
 _CAMPAIGN_PATTERN = re.compile(r"^C\d{4}$", re.IGNORECASE)
 _GROUP_PATTERN = re.compile(r"^G\d{4}$", re.IGNORECASE)
@@ -85,12 +103,87 @@ class IOCType(str, Enum):
     url = "url"
 
 
-# Shared flags for the nine entity commands. ``--search`` is the alternative to
+# Shared flags for the eleven entity commands. ``--search`` is the alternative to
 # a direct id lookup; ``--framework`` only appears on the three whose request
 # model carries the field (campaign, group, software) plus ``technique``.
 SearchOption = Annotated[
     str | None,
     typer.Option("--search", help="Search by name/description instead of a direct id lookup.", show_default=False),
+]
+
+
+# `--include` replaces the command's default layer set.
+def _include_help(family: str, cli_defaults: list[str]) -> str:
+    """Describe accepted values and API/CLI defaults for this endpoint."""
+    return (
+        "Replace the default layer set; repeat --include for multiple layers. "
+        + _includes.describe(family, default_label="API defaults")
+        + " CLI defaults: "
+        + ", ".join(cli_defaults)
+        + "."
+    )
+
+
+# Type aliases, not runtime factory calls: mypy only accepts an `Annotated[...]` assignment as a
+# usable parameter type (a call's return value is a variable, so every command signature failed
+# `[valid-type]`). Typer reads the same metadata either way.
+CVEIncludeOption = Annotated[
+    list[str] | None,
+    typer.Option("--include", help=_include_help("CVE", [*presets.CVE_FULL_WALK, "poc"]), show_default=False),
+]
+PRODUCTIncludeOption = Annotated[
+    list[str] | None,
+    typer.Option("--include", help=_include_help("PRODUCT", presets.PRODUCT_FULL), show_default=False),
+]
+TECHNIQUEIncludeOption = Annotated[
+    list[str] | None,
+    typer.Option("--include", help=_include_help("TECHNIQUE", [*presets.TECHNIQUE_FULL, "cves"]), show_default=False),
+]
+PACKAGEIncludeOption = Annotated[
+    list[str] | None,
+    typer.Option("--include", help=_include_help("PACKAGE", presets.PACKAGE_FULL), show_default=False),
+]
+IOCIncludeOption = Annotated[
+    list[str] | None,
+    typer.Option(
+        "--include",
+        help=_include_help("IOC", [*presets.IOC_FULL_WALK, "warninglist", "sightings", "cves"]),
+        show_default=False,
+    ),
+]
+CWEIncludeOption = Annotated[
+    list[str] | None, typer.Option("--include", help=_include_help("CWE", [*presets.CWE_FULL_WALK, "cves"]))
+]
+ATLASIncludeOption = Annotated[
+    list[str] | None, typer.Option("--include", help=_include_help("ATLAS", presets.ATLAS_FULL))
+]
+CAMPAIGNIncludeOption = Annotated[
+    list[str] | None, typer.Option("--include", help=_include_help("CAMPAIGN", presets.CAMPAIGN_FULL))
+]
+CAPECIncludeOption = Annotated[
+    list[str] | None, typer.Option("--include", help=_include_help("CAPEC", presets.CAPEC_FULL))
+]
+CLOAKIncludeOption = Annotated[
+    list[str] | None, typer.Option("--include", help=_include_help("CLOAK", presets.CLOAK_FULL))
+]
+DEFENDIncludeOption = Annotated[
+    list[str] | None, typer.Option("--include", help=_include_help("D3FEND", presets.DEFEND_FULL))
+]
+DISARMIncludeOption = Annotated[
+    list[str] | None, typer.Option("--include", help=_include_help("DISARM", presets.DISARM_FULL))
+]
+F3IncludeOption = Annotated[list[str] | None, typer.Option("--include", help=_include_help("F3", presets.F3_FULL))]
+GROUPIncludeOption = Annotated[
+    list[str] | None, typer.Option("--include", help=_include_help("GROUP", presets.GROUP_FULL))
+]
+LOCATIONIncludeOption = Annotated[
+    list[str] | None, typer.Option("--include", help=_include_help("LOCATION", presets.LOCATION_FULL))
+]
+SECTORIncludeOption = Annotated[
+    list[str] | None, typer.Option("--include", help=_include_help("SECTOR", presets.SECTOR_FULL))
+]
+SOFTWAREIncludeOption = Annotated[
+    list[str] | None, typer.Option("--include", help=_include_help("SOFTWARE", presets.SOFTWARE_FULL))
 ]
 FrameworkOption = Annotated[
     Framework,
@@ -105,10 +198,21 @@ def cve_command(
         str,
         typer.Argument(help="CVE identifier (e.g. CVE-2024-3400)", show_default=False),
     ],
+    include: CVEIncludeOption = None,
+    max_bytes: Annotated[
+        int,
+        typer.Option(
+            "--max-bytes", min=1, help="Maximum collected OSV walk result bytes (compact UTF-8 JSON, not RSS)."
+        ),
+    ] = DEFAULT_MAX_BYTES,
     _json: output.JsonFlag = False,
     _expand: output.ExpandFlag = False,
 ) -> None:
-    """Walk the full CVE chain and render the result."""
+    """Walk the full CVE chain and render the result.
+
+    OSV advisories are paged behind a snapshot cursor; the command follows it to the end under
+    ``--max-bytes`` and prints nothing if the ceiling or the snapshot is lost mid-walk.
+    """
     if not _CVE_PATTERN.match(cve_id):
         raise BadInputError(f"Malformed CVE id: {cve_id!r} (expected CVE-YYYY-NNNN…)")
     resolved = auth.resolve_auth()
@@ -119,8 +223,12 @@ def cve_command(
             # Layer "poc" onto the default walk so the renderer's "PoC count"
             # row is populated — the API only fills poc_count when "poc" is in
             # the include set (#193). The SDK preset itself stays unchanged.
-            response = await client.enrich_cve_full(normalized, include=[*presets.CVE_FULL_WALK, "poc"])
-            return response.to_dict()
+            return await collect_osv_walk(
+                client.iter_cve_osv_pages(
+                    normalized, include=list(include) if include else [*presets.CVE_FULL_WALK, "poc"]
+                ),
+                max_bytes=max_bytes,
+            )
 
     payload = _formatters.with_status(f"Enriching {normalized}…", _call())
     output.render(payload, partial(_formatters.render_cve, requested_id=normalized))
@@ -145,6 +253,7 @@ def product_command(
             help="Filter CVEs to those affecting this version (major-line: '7' matches 7.x; '2.4.51' exact + ranges).",
         ),
     ] = None,
+    include: PRODUCTIncludeOption = None,
     _json: output.JsonFlag = False,
     _expand: output.ExpandFlag = False,
 ) -> None:
@@ -166,18 +275,43 @@ def product_command(
 
     async def _call() -> dict[str, Any]:
         async with build_client(resolved) as client:
-            response = await client.enrich_product_full(
+            payload: dict[str, Any] | None = None
+            async for response in client.iter_product_cves(
                 final_product,
                 version=version,
                 vendor=final_vendor,
-            )
-            return response.to_dict()
+                include=list(include) if include else None,
+            ):
+                page = response.to_dict()
+                if payload is None:
+                    payload = page
+                    continue
+                payload["cves"].extend(page["cves"])
+                payload["version_unconfirmed_cves"].extend(page["version_unconfirmed_cves"])
+                payload["paging_incomplete"] = bool(payload.get("paging_incomplete") or page.get("paging_incomplete"))
+                for error in page["errors"]:
+                    if error not in payload["errors"]:
+                        payload["errors"].append(error)
+            if payload is None:
+                raise ValueError("Product enrichment returned no pages")
+            payload["cves_next_offset"] = None
+            return payload
 
     label = f"{final_vendor + '/' if final_vendor else ''}{final_product}"
     if version:
         label = f"{label} @ {version}"
     payload = _formatters.with_status(f"Enriching {label}…", _call())
     output.render(payload, _formatters.render_product)
+
+
+def _package_bytes_remaining(value: Any, remaining: int) -> int:
+    for chunk in json.JSONEncoder(ensure_ascii=False, separators=(",", ":"), allow_nan=False).iterencode(value):
+        if len(chunk) > remaining:
+            raise CLIError("package_walk_too_large: package results exceed --max-bytes")
+        remaining -= len(chunk.encode("utf-8"))
+        if remaining < 0:
+            raise CLIError("package_walk_too_large: package results exceed --max-bytes")
+    return remaining
 
 
 @app.command("package", help="Enrich an open-source package — OSV advisories + matching CVEs (npm/PyPI/Go/…).")
@@ -195,6 +329,10 @@ def package_command(
         str | None,
         typer.Option("--version", help="Installed version to filter advisories to."),
     ] = None,
+    include: PACKAGEIncludeOption = None,
+    max_bytes: Annotated[int, typer.Option("--max-bytes", min=1, help="Maximum collected package result bytes.")] = (
+        256 * 1024 * 1024
+    ),
     _json: output.JsonFlag = False,
     _expand: output.ExpandFlag = False,
 ) -> None:
@@ -208,15 +346,41 @@ def package_command(
 
     async def _call() -> dict[str, Any]:
         async with build_client(resolved) as client:
-            response = await client.enrich_package_full(ecosystem, package, version=version)
-            return response.to_dict()
+            payload: dict[str, Any] | None = None
+            remaining = max_bytes
+            async for response in client.iter_package_advisories(
+                ecosystem, package, version=version, include=list(include) if include else None
+            ):
+                page = response.to_dict()
+                if payload is None:
+                    payload = page
+                    payload.setdefault("advisories", [])
+                    payload.setdefault("cves", [])
+                    payload.setdefault("errors", [])
+                    payload["paging_incomplete"] = bool(payload.get("paging_incomplete"))
+                    payload["next_offset"] = None
+                    remaining = _package_bytes_remaining(payload, remaining)
+                    continue
+                for field in ("advisories", "cves"):
+                    for item in page.get(field, []):
+                        remaining = _package_bytes_remaining(item, remaining - 1)
+                        payload[field].append(item)
+                payload["paging_incomplete"] = bool(payload.get("paging_incomplete") or page.get("paging_incomplete"))
+                for error in page.get("errors", []):
+                    if error not in payload["errors"]:
+                        remaining = _package_bytes_remaining(error, remaining - 1)
+                        payload["errors"].append(error)
+            if payload is None:
+                raise ValueError("Package enrichment returned no pages")
+            payload["next_offset"] = None
+            return payload
 
     label = f"{ecosystem}/{package}" + (f" @ {version}" if version else "")
     payload = _formatters.with_status(f"Enriching {label}…", _call())
     output.render(payload, _formatters.render_package)
 
 
-@app.command("ioc", help="Enrich an IOC — MISP attributes, ATT&CK links, knowledge base/web context.")
+@app.command("ioc", help="Enrich an IOC — MISP attributes, ATT&CK links, knowledge base context.")
 @handle_errors
 def ioc_command(
     value: Annotated[
@@ -227,6 +391,7 @@ def ioc_command(
         IOCType,
         typer.Option("--type", help="MISP-style attribute type.", case_sensitive=False),
     ] = IOCType.ip_dst,
+    include: IOCIncludeOption = None,
     _json: output.JsonFlag = False,
     _expand: output.ExpandFlag = False,
 ) -> None:
@@ -241,7 +406,7 @@ def ioc_command(
             response = await client.enrich_ioc_full(
                 value,
                 ioc_type=ioc_type.value,
-                include=[*presets.IOC_FULL_WALK, "warninglist", "sightings", "cves"],
+                include=list(include) if include else [*presets.IOC_FULL_WALK, "warninglist", "sightings", "cves"],
             )
             return response.to_dict()
 
@@ -253,41 +418,60 @@ def ioc_command(
 @handle_errors
 def cwe_command(
     cwe_id: Annotated[
-        str,
+        str | None,
         typer.Argument(help="CWE identifier (e.g. CWE-79)", show_default=False),
-    ],
+    ] = None,
+    search: Annotated[
+        str | None,
+        typer.Option("--search", help="Discover weaknesses by name or description.", show_default=False),
+    ] = None,
+    include: CWEIncludeOption = None,
     _json: output.JsonFlag = False,
     _expand: output.ExpandFlag = False,
 ) -> None:
-    """Validate the CWE id locally, then walk the CWE chain and render it."""
-    if not _CWE_PATTERN.match(cwe_id):
+    """Validate the CWE id locally (or search by name), then walk the CWE chain and render it."""
+    if cwe_id is not None and not _CWE_PATTERN.match(cwe_id):
         raise BadInputError(f"Malformed CWE id: {cwe_id!r} (expected CWE-NNN…)")
+    if cwe_id is None and search is None:
+        raise BadInputError("Pass a CWE id or --search TEXT.")
     resolved = auth.resolve_auth()
-    normalized = cwe_id.upper()
+    normalized = cwe_id.upper() if cwe_id else None
+    label = normalized or f"'{search}'"
 
     async def _call() -> dict:
         async with build_client(resolved) as client:
             # "cves" drives both the Linked-CVEs row and the Exploitation-class
             # row (exploitation_frequency is computed only when CVEs resolve);
             # the default CWE_FULL_WALK omits it (#191/#193).
-            response = await client.enrich_cwe_full(normalized, include=[*presets.CWE_FULL_WALK, "cves"])
+            response = await client.enrich_cwe_full(
+                normalized, search=search, include=list(include) if include else [*presets.CWE_FULL_WALK, "cves"]
+            )
             return response.to_dict()
 
-    payload = _formatters.with_status(f"Enriching {normalized}…", _call())
-    output.render(payload, partial(_formatters.render_cwe, requested_id=normalized))
+    payload = _formatters.with_status(f"Enriching {label}…", _call())
+    output.render(payload, partial(_formatters.render_cwe, requested_id=label))
 
 
 @app.command("technique", help="Enrich an ATT&CK technique — adversary attribution, linked CVEs, Navigator.")
 @handle_errors
 def technique_command(
     technique_id: Annotated[
-        str,
+        str | None,
         typer.Argument(help="ATT&CK technique (e.g. T1190, T1059.001)", show_default=False),
-    ],
+    ] = None,
+    asset_id: Annotated[
+        str | None,
+        typer.Option(
+            "--asset-id",
+            help="ICS asset to look up from (e.g. A0002) — requires --framework ics; replaces the technique id.",
+            show_default=False,
+        ),
+    ] = None,
     framework: Annotated[
         Framework,
         typer.Option("--framework", help="ATT&CK matrix variant.", case_sensitive=False),
     ] = Framework.enterprise,
+    include: TECHNIQUEIncludeOption = None,
     _json: output.JsonFlag = False,
     _expand: output.ExpandFlag = False,
 ) -> None:
@@ -295,24 +479,39 @@ def technique_command(
 
     Returns the technique detail plus tactics, the groups/software/campaigns using it, linked CVEs,
     and Navigator JSON — the closest thing the API exposes to a one-shot "attack path" view.
+
+    ``--asset-id`` is the ICS-asset lookup: it names the selector instead of a technique, so pass it
+    (with ``--framework ics``) on its own rather than alongside a technique id.
     """
-    if not _TECHNIQUE_PATTERN.match(technique_id):
+    if technique_id is None and asset_id is None:
+        raise BadInputError("Pass a technique id or --asset-id.")
+    if technique_id is not None and asset_id is not None:
+        raise BadInputError("Pass either a technique id or --asset-id, not both.")
+    if asset_id is not None:
+        if framework is not Framework.ics:
+            raise BadInputError("--asset-id requires --framework ics.")
+        if not _ASSET_PATTERN.match(asset_id):
+            raise BadInputError(f"Malformed ICS asset id: {asset_id!r} (expected A0001…)")
+    elif not _TECHNIQUE_PATTERN.match(technique_id or ""):
         raise BadInputError(f"Malformed technique id: {technique_id!r} (expected T1190 or T1059.001)")
-    normalized = technique_id.upper()
+    normalized = technique_id.upper() if technique_id else None
+    asset = asset_id.upper() if asset_id else None
     resolved = auth.resolve_auth()
 
     async def _call() -> dict[str, Any]:
         async with build_client(resolved) as client:
             # "cves" drives the Linked-CVEs row; the default TECHNIQUE_FULL preset omits it (#191/#193).
             response = await client.enrich_technique_full(
-                [normalized],
+                [normalized] if normalized else None,
                 framework=framework.value,
-                include=[*presets.TECHNIQUE_FULL, "cves"],
+                include=list(include) if include else [*presets.TECHNIQUE_FULL, "cves"],
+                asset_id=asset,
             )
             return response.to_dict()
 
-    payload = _formatters.with_status(f"Enriching {normalized} ({framework.value})…", _call())
-    output.render(payload, partial(_formatters.render_technique, requested_id=normalized))
+    label = normalized or asset or ""
+    payload = _formatters.with_status(f"Enriching {label} ({framework.value})…", _call())
+    output.render(payload, partial(_formatters.render_technique, requested_id=label))
 
 
 # -- entity endpoints (id-or-search) -------------------------------------------- #
@@ -327,7 +526,7 @@ def _resolve_target(
 ) -> tuple[str | None, str]:
     """Validate the id-or-search pair; return ``(normalized_id, spinner_label)``.
 
-    The nine entity endpoints each accept a direct identifier *or* a text
+    The eleven entity endpoints each accept a direct identifier *or* a text
     search. Requiring exactly one keeps the request unambiguous and costs no
     round trip. ``pattern``, when given, is that id space's canonical format —
     those ids are also case-normalized. Slug-shaped id spaces (D3FEND,
@@ -350,7 +549,7 @@ def _resolve_target(
 def _run_entity_enrich(label: str, call: Callable[[Any], Awaitable[Any]]) -> None:
     """Resolve auth, run ``call`` under the spinner, and render the entity payload.
 
-    The nine entity endpoints differ only in which SDK method they call and
+    The eleven entity endpoints differ only in which SDK method they call and
     which flags feed it, so each command body stays one validation step plus
     one lambda. Every response shares the
     "primary entity or ``search_results``, plus walked layers" shape that
@@ -375,12 +574,16 @@ def atlas_command(
         typer.Argument(help="ATLAS technique id (e.g. AML.T0043).", show_default=False),
     ] = None,
     search: SearchOption = None,
+    include: ATLASIncludeOption = None,
     _json: output.JsonFlag = False,
     _expand: output.ExpandFlag = False,
 ) -> None:
     """Look up one ATLAS technique, or search the AI/ML matrix by text."""
     normalized, label = _resolve_target(technique_id, search, label="ATLAS technique id", pattern=_ATLAS_PATTERN)
-    _run_entity_enrich(label, lambda client: client.enrich_atlas_full(normalized, search=search))
+    _run_entity_enrich(
+        label,
+        lambda client: client.enrich_atlas_full(normalized, search=search, include=list(include) if include else None),
+    )
 
 
 @app.command("campaign", help="Enrich an ATT&CK campaign — techniques, attributed groups, software, CVEs.")
@@ -392,6 +595,7 @@ def campaign_command(
     ] = None,
     search: SearchOption = None,
     framework: FrameworkOption = Framework.enterprise,
+    include: CAMPAIGNIncludeOption = None,
     _json: output.JsonFlag = False,
     _expand: output.ExpandFlag = False,
 ) -> None:
@@ -399,7 +603,9 @@ def campaign_command(
     normalized, label = _resolve_target(campaign_id, search, label="campaign id", pattern=_CAMPAIGN_PATTERN)
     _run_entity_enrich(
         f"{label} ({framework.value})",
-        lambda client: client.enrich_campaign_full(normalized, search=search, framework=framework.value),
+        lambda client: client.enrich_campaign_full(
+            normalized, search=search, framework=framework.value, include=list(include) if include else None
+        ),
     )
 
 
@@ -411,12 +617,36 @@ def capec_command(
         typer.Argument(help="CAPEC identifier (e.g. CAPEC-66).", show_default=False),
     ] = None,
     search: SearchOption = None,
+    include: CAPECIncludeOption = None,
     _json: output.JsonFlag = False,
     _expand: output.ExpandFlag = False,
 ) -> None:
     """Look up one CAPEC attack pattern, or search attack patterns by text."""
     normalized, label = _resolve_target(capec_id, search, label="CAPEC id", pattern=_CAPEC_PATTERN)
-    _run_entity_enrich(label, lambda client: client.enrich_capec_full(normalized, search=search))
+    _run_entity_enrich(
+        label,
+        lambda client: client.enrich_capec_full(normalized, search=search, include=list(include) if include else None),
+    )
+
+
+@app.command("cloak", help="Enrich a CLOAK concealment technique or tool — knowledge base context.")
+@handle_errors
+def cloak_command(
+    cloak_id: Annotated[
+        str | None,
+        typer.Argument(help="CLOAK id (tool TTP-496, or technique ta6-te129).", show_default=False),
+    ] = None,
+    search: SearchOption = None,
+    include: CLOAKIncludeOption = None,
+    _json: output.JsonFlag = False,
+    _expand: output.ExpandFlag = False,
+) -> None:
+    """Look up one CLOAK object, or search the concealment corpus by text."""
+    normalized, label = _resolve_target(cloak_id, search, label="CLOAK id", pattern=_CLOAK_PATTERN)
+    _run_entity_enrich(
+        label,
+        lambda client: client.enrich_cloak_full(normalized, search=search, include=list(include) if include else None),
+    )
 
 
 @app.command("defend", help="Enrich a D3FEND defensive technique — the ATT&CK techniques it counters.")
@@ -427,15 +657,19 @@ def defend_command(
         typer.Argument(help="D3FEND identifier (e.g. D3-AL).", show_default=False),
     ] = None,
     search: SearchOption = None,
+    include: DEFENDIncludeOption = None,
     _json: output.JsonFlag = False,
     _expand: output.ExpandFlag = False,
 ) -> None:
     """Look up one D3FEND countermeasure, or search defensive techniques by text."""
     normalized, label = _resolve_target(d3fend_id, search, label="D3FEND id")
-    _run_entity_enrich(label, lambda client: client.enrich_defend_full(normalized, search=search))
+    _run_entity_enrich(
+        label,
+        lambda client: client.enrich_defend_full(normalized, search=search, include=list(include) if include else None),
+    )
 
 
-@app.command("disarm", help="Enrich a DISARM disinformation technique — countermeasures, actors, campaigns.")
+@app.command("disarm", help="Enrich a DISARM disinformation technique — family links, KB context.")
 @handle_errors
 def disarm_command(
     technique_id: Annotated[
@@ -443,15 +677,39 @@ def disarm_command(
         typer.Argument(help="DISARM technique id (e.g. T0001).", show_default=False),
     ] = None,
     search: SearchOption = None,
+    include: DISARMIncludeOption = None,
     _json: output.JsonFlag = False,
     _expand: output.ExpandFlag = False,
 ) -> None:
     """Look up one DISARM technique, or search the influence-operations matrix."""
     normalized, label = _resolve_target(technique_id, search, label="DISARM technique id", pattern=_DISARM_PATTERN)
-    _run_entity_enrich(label, lambda client: client.enrich_disarm_full(normalized, search=search))
+    _run_entity_enrich(
+        label,
+        lambda client: client.enrich_disarm_full(normalized, search=search, include=list(include) if include else None),
+    )
 
 
-@app.command("group", help="Enrich an ATT&CK group — techniques, software, campaigns, targeted sectors, CVEs.")
+@app.command("f3", help="Enrich a MITRE F3 fraud technique — linked ATT&CK techniques, knowledge base.")
+@handle_errors
+def f3_command(
+    f3_id: Annotated[
+        str | None,
+        typer.Argument(help="MITRE F3 id (e.g. F1031, F1025.003; ATT&CK-borrowed T1593.002).", show_default=False),
+    ] = None,
+    search: SearchOption = None,
+    include: F3IncludeOption = None,
+    _json: output.JsonFlag = False,
+    _expand: output.ExpandFlag = False,
+) -> None:
+    """Look up one F3 fraud technique, or search the Fight Fraud Framework by text."""
+    normalized, label = _resolve_target(f3_id, search, label="F3 id", pattern=_F3_PATTERN)
+    _run_entity_enrich(
+        label,
+        lambda client: client.enrich_f3_full(normalized, search=search, include=list(include) if include else None),
+    )
+
+
+@app.command("group", help="Enrich an ATT&CK group — techniques, software, campaigns, CVEs.")
 @handle_errors
 def group_command(
     group_id: Annotated[
@@ -460,47 +718,80 @@ def group_command(
     ] = None,
     search: SearchOption = None,
     framework: FrameworkOption = Framework.enterprise,
+    include: GROUPIncludeOption = None,
     _json: output.JsonFlag = False,
     _expand: output.ExpandFlag = False,
 ) -> None:
     """Look up one adversary group, or search groups by name/alias (e.g. 'APT28')."""
     normalized, label = _resolve_target(group_id, search, label="group id", pattern=_GROUP_PATTERN)
-    _run_entity_enrich(
-        f"{label} ({framework.value})",
-        lambda client: client.enrich_group_full(normalized, search=search, framework=framework.value),
-    )
+    resolved = auth.resolve_auth()
+
+    async def _call() -> dict[str, Any]:
+        async with build_client(resolved) as client:
+            payload: dict[str, Any] | None = None
+            async for response in client.iter_group_pages(
+                normalized, search=search, framework=framework.value, include=list(include) if include else None
+            ):
+                page = response.to_dict()
+                if payload is None:
+                    payload = page
+                    continue
+                payload["group"]["techniques"].extend(page["group"]["techniques"])
+                payload["paging_incomplete"] = bool(payload.get("paging_incomplete") or page.get("paging_incomplete"))
+                for error in page.get("errors") or []:
+                    if error not in payload["errors"]:
+                        payload["errors"].append(error)
+            if payload is None:
+                raise ValueError("Group enrichment returned no pages")
+            payload["techniques_next_offset"] = None
+            payload["log_source_catalog"] = []
+            payload["log_source_refs"] = {}
+            return payload
+
+    payload = _formatters.with_status(f"Enriching {label} ({framework.value})…", _call())
+    output.render(payload, partial(_formatters.render_entity, requested=f"{label} ({framework.value})"))
 
 
-@app.command("location", help="Enrich an ATT&CK location — groups and techniques targeting that country/region.")
+@app.command("location", help="Enrich a location — its metadata plus knowledge base context.")
 @handle_errors
 def location_command(
     location_id: Annotated[
         str | None,
-        typer.Argument(help="ATT&CK location id (e.g. L0001).", show_default=False),
+        typer.Argument(help="Location id (ISO country code or STIX id, e.g. US).", show_default=False),
     ] = None,
     search: SearchOption = None,
+    include: LOCATIONIncludeOption = None,
     _json: output.JsonFlag = False,
     _expand: output.ExpandFlag = False,
 ) -> None:
     """Look up one location, or search by country/region name (e.g. 'United States')."""
     normalized, label = _resolve_target(location_id, search, label="location id")
-    _run_entity_enrich(label, lambda client: client.enrich_location_full(normalized, search=search))
+    _run_entity_enrich(
+        label,
+        lambda client: client.enrich_location_full(
+            normalized, search=search, include=list(include) if include else None
+        ),
+    )
 
 
-@app.command("sector", help="Enrich an industry sector — the groups and techniques that target it.")
+@app.command("sector", help="Enrich an industry sector — its metadata plus knowledge base context.")
 @handle_errors
 def sector_command(
     sector_id: Annotated[
         str | None,
-        typer.Argument(help="Sector identifier (e.g. financial-services).", show_default=False),
+        typer.Argument(help="Sector identifier (e.g. financial-organizations).", show_default=False),
     ] = None,
     search: SearchOption = None,
+    include: SECTORIncludeOption = None,
     _json: output.JsonFlag = False,
     _expand: output.ExpandFlag = False,
 ) -> None:
     """Look up one sector, or search sectors by name (e.g. 'healthcare')."""
     normalized, label = _resolve_target(sector_id, search, label="sector id")
-    _run_entity_enrich(label, lambda client: client.enrich_sector_full(normalized, search=search))
+    _run_entity_enrich(
+        label,
+        lambda client: client.enrich_sector_full(normalized, search=search, include=list(include) if include else None),
+    )
 
 
 @app.command("software", help="Enrich ATT&CK software — techniques it implements, groups using it, linked CVEs.")
@@ -512,6 +803,7 @@ def software_command(
     ] = None,
     search: SearchOption = None,
     framework: FrameworkOption = Framework.enterprise,
+    include: SOFTWAREIncludeOption = None,
     _json: output.JsonFlag = False,
     _expand: output.ExpandFlag = False,
 ) -> None:
@@ -519,7 +811,9 @@ def software_command(
     normalized, label = _resolve_target(software_id, search, label="software id", pattern=_SOFTWARE_PATTERN)
     _run_entity_enrich(
         f"{label} ({framework.value})",
-        lambda client: client.enrich_software_full(normalized, search=search, framework=framework.value),
+        lambda client: client.enrich_software_full(
+            normalized, search=search, framework=framework.value, include=list(include) if include else None
+        ),
     )
 
 
@@ -658,8 +952,10 @@ __all__ = [
     "atlas_command",
     "campaign_command",
     "capec_command",
+    "cloak_command",
     "defend_command",
     "disarm_command",
+    "f3_command",
     "group_command",
     "location_command",
     "sector_command",

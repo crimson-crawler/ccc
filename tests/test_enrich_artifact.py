@@ -54,7 +54,13 @@ def test_artifact_enrich_text_summary(
     assert "WATCH 1" in result.stdout
     assert "Patch Apache" in result.stdout
     mock_sdk.enricher.enrich.assert_awaited_once_with(
-        text="Suspicious login from 10.1.1.1", files=None, include=None, on_progress=ANY, save=False
+        text="Suspicious login from 10.1.1.1",
+        files=None,
+        attached_artifact_ids=None,
+        include=None,
+        on_progress=ANY,
+        save=False,
+        tlp=None,
     )
 
 
@@ -193,4 +199,74 @@ def test_artifact_enrich_save_flag_passes_through_and_shows_id(
 
     assert result.exit_code == 0, result.stdout + result.stderr
     assert "art-42" in result.stdout  # the "Saved to library" row
-    mock_sdk.enricher.enrich.assert_awaited_once_with(text="x", files=None, include=None, on_progress=ANY, save=True)
+    mock_sdk.enricher.enrich.assert_awaited_once_with(
+        text="x", files=None, attached_artifact_ids=None, include=None, on_progress=ANY, save=True, tlp=None
+    )
+
+
+def test_artifact_enrich_tlp_flag_canonicalised(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, clean_env: Path, mock_sdk
+) -> None:
+    monkeypatch.setenv("CRIMSON_CRAWLER_API_KEY", "test-key-1234")
+    mock_sdk.enricher.enrich.return_value = _REPORT
+
+    result = runner.invoke(app, ["artifact-enrich", "--text", "x", "--tlp", "amber"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert mock_sdk.enricher.enrich.call_args.kwargs["tlp"] == "AMBER"
+
+
+def test_artifact_enrich_invalid_tlp_is_a_usage_error_before_the_submit(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, clean_env: Path, mock_sdk
+) -> None:
+    monkeypatch.setenv("CRIMSON_CRAWLER_API_KEY", "test-key-1234")
+
+    result = runner.invoke(app, ["artifact-enrich", "--text", "x", "--tlp", "WHITE"])
+
+    assert result.exit_code == ExitCode.BAD_INPUT  # usage errors are 64 here, not Click's 2
+    # The usage error lists the canonical UPPERCASE spellings, not casefolded ones.
+    # Flatten Rich's panel borders/line wrap before matching the list.
+    assert "'CLEAR', 'GREEN', 'AMBER', 'AMBER+STRICT', 'RED'" in " ".join(result.output.replace("│", " ").split())
+    mock_sdk.enricher.enrich.assert_not_awaited()
+
+
+def test_artifact_enrich_shows_exploit_evidence_and_threat_context(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, clean_env: Path, mock_sdk
+) -> None:
+    # Report schema 2.2: KEV-listed CVEs sort first; Metasploit rank, EPSS percentile, and fix render per CVE;
+    # a sector reports its targeting-actor count; the two rollups' forecasts merge, highest probability first.
+    monkeypatch.setenv("CRIMSON_CRAWLER_API_KEY", "test-key-1234")
+    mock_sdk.enricher.enrich.return_value = {
+        "enrichment_id": "x1",
+        "report": {
+            "references": [
+                {"type": "cve", "value": "CVE-2000-0002", "score": 90, "epss": 0.2},
+                {
+                    "type": "cve",
+                    "value": "CVE-2000-0001",
+                    "kev_due_date": "2026-01-01",
+                    "epss": 0.97,
+                    "epss_percentile": 0.999,
+                    "metasploit_modules": [{"rank_label": "Excellent"}],
+                    "fixed_versions": ["2.15.0"],
+                },
+                {
+                    "type": "sector",
+                    "value": "health",
+                    "sector": {"name": "Health"},
+                    "threat_actors_targeting": ["APT41", "APT9"],
+                },
+            ],
+            "rollups": {
+                "technique_coverage": {"predictions": [{"technique_id": "T1036", "probability": 0.17}]},
+                "group_exposure": {"predictions": [{"technique_id": "T1055", "probability": 0.3}]},
+            },
+        },
+    }
+    result = runner.invoke(app, ["artifact-enrich", "--text", "x"])
+    assert result.exit_code == 0, result.stdout + result.stderr
+    out = result.stdout
+    assert out.index("CVE-2000-0001") < out.index("CVE-2000-0002")
+    assert "Excellent" in out and "99.9%" in out and "2.15.0" in out
+    assert "Health (sector): targeted by 2 known actors" in out
+    assert "Likely next: T1055 30%, T1036 17%" in out

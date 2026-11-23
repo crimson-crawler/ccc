@@ -112,6 +112,21 @@ def test_build_inventory_constraint_version_becomes_requirement_property():
     assert {"name": "crimson:requirement", "value": ">=2.31"} in comp["properties"]
 
 
+def test_build_inventory_compound_constraint_emits_one_component(tmp_path):
+    """#360: ``crimson-crawler-client>=5.0,<6.0`` with no lock pin used to split on
+    the comma into two unversioned components (``>=5.0`` and ``<6.0``). One
+    requirement must emit exactly one component carrying the whole constraint."""
+    (tmp_path / "pyproject.toml").write_text('[project]\ndependencies = ["crimson-crawler-client>=5.0,<6.0"]\n')
+    comps = inventory.build_inventory(crawl.crawl(tmp_path)[0], "t")["components"]
+    libs = [c for c in comps if c["name"] == "crimson-crawler-client"]
+    assert len(libs) == 1
+    assert "version" not in libs[0]
+    assert libs[0]["purl"] == "pkg:pypi/crimson-crawler-client"
+    assert {"name": "crimson:requirement", "value": ">=5.0,<6.0"} in libs[0]["properties"]
+    # a genuine multi-pin spec still fans out
+    assert inventory.split_versions(["1.0,2.0"]) == ["1.0", "2.0"]
+
+
 def test_build_inventory_unknown_version_has_no_version_no_requirement():
     a = inventory.asset("package", "httpx", None, ["unknown"], "x", ecosystem="PyPI")
     comp = inventory.build_inventory([a], "t")["components"][0]
@@ -1080,3 +1095,187 @@ def test_parse_pyproject_malformed_and_non_table(tmp_path):
 )
 def test_poetry_version_spec_forms(spec, expected):
     assert crawl._poetry_version(spec) == expected
+
+
+# ============================================================
+# #349 — lockfile-backed version resolution
+# ============================================================
+
+_UV_LOCK_HEAD = (
+    "version = 1\n"
+    "[[package]]\n"
+    'name = "httpx"\n'
+    'version = "0.28.1"\n'
+    'source = { registry = "https://pypi.org/simple" }\n'
+    "[[package]]\n"
+    'name = "click"\n'
+    'version = "8.1.7"\n'
+    'source = { registry = "https://pypi.org/simple" }\n'
+)
+
+
+def _component_property(comp: dict, prop: str) -> str | None:
+    return next((p["value"] for p in comp.get("properties", []) if p["name"] == prop), None)
+
+
+def test_crawl_pyproject_uv_lock_resolves_constraint(tmp_path):
+    (tmp_path / "pyproject.toml").write_text('[project]\ndependencies = ["httpx>=0.28", "click==8.1.7"]\n')
+    (tmp_path / "uv.lock").write_text(_UV_LOCK_HEAD)
+    components = inventory.build_inventory(crawl.crawl(tmp_path)[0], "2026-09-05T00:00:00Z")["components"]
+    httpx = next(c for c in components if c.get("purl") == "pkg:pypi/httpx@0.28.1")
+    assert httpx["version"] == "0.28.1"
+    assert _component_property(httpx, "crimson:requirement") == ">=0.28"
+    # the pin that was concrete stays concrete, with no requirement property
+    click = next(c for c in components if c.get("purl") == "pkg:pypi/click@8.1.7")
+    assert click["version"] == "8.1.7"
+    assert _component_property(click, "crimson:requirement") is None
+
+
+def test_crawl_pyproject_uv_lock_name_normalisation(tmp_path):
+    (tmp_path / "pyproject.toml").write_text('[project]\ndependencies = ["SQLAlchemy>=2.0"]\n')
+    (tmp_path / "uv.lock").write_text(
+        "version = 1\n"
+        "[[package]]\n"
+        'name = "sqlalchemy"\n'
+        'version = "2.0.48"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+    )
+    comps = inventory.build_inventory(crawl.crawl(tmp_path)[0], "2026-09-05T00:00:00Z")["components"]
+    sqlalchemy = next(c for c in comps if c.get("name") == "sqlalchemy")
+    assert sqlalchemy["version"] == "2.0.48"
+    assert _component_property(sqlalchemy, "crimson:requirement") == ">=2.0"
+
+
+def test_crawl_pyproject_poetry_lock_resolves(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.poetry.dependencies]\n"
+        'python = "^3.12"\n'
+        'requests = "^2.31"\n'
+        'ruff = { version = ">=0.4" }\n'
+        "\n[tool.poetry.group.runtime.dependencies]\n"
+        'orjson = "^3.10"\n'
+    )
+    (tmp_path / "poetry.lock").write_text(
+        "[[package]]\n"
+        'name = "requests"\n'
+        'version = "2.32.3"\n'
+        'description = "Python HTTP for Humans."\n'
+        "\n[[package]]\n"
+        'name = "ruff"\n'
+        'version = "0.15.0"\n'
+        "\n[[package]]\n"
+        'name = "orjson"\n'
+        'version = "3.10.15"\n'
+    )
+    comps = inventory.build_inventory(crawl.crawl(tmp_path)[0], "2026-09-05T00:00:00Z")["components"]
+    by_name = {c["name"]: c for c in comps}
+    requests = by_name["requests"]
+    assert requests["version"] == "2.32.3"
+    assert _component_property(requests, "crimson:requirement") == "^2.31"
+    assert by_name["ruff"]["version"] == "0.15.0"
+    orjson = by_name["orjson"]
+    assert orjson["version"] == "3.10.15"
+    assert _component_property(orjson, "crimson:requirement") == "^3.10"
+
+
+def test_crawl_package_json_lockfile_resolves_incl_scoped(tmp_path):
+    (tmp_path / "package.json").write_text(
+        json.dumps(
+            {
+                "dependencies": {
+                    "@dicebear/core": "^9.2.2",
+                    "undici": "^7.29.0",
+                    "exact": "1.2.3",
+                }
+            }
+        )
+    )
+    (tmp_path / "package-lock.json").write_text(
+        json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "": {"name": "x", "version": "1.0.0", "dependencies": {"undici": "^7.29.0"}},
+                    "node_modules/@dicebear/core": {"version": "9.2.2"},
+                    "node_modules/undici": {"version": "7.29.0"},
+                    "node_modules/exact": {"version": "1.2.3"},
+                    "node_modules/undici/node_modules/undici": {"version": "7.30.0"},
+                },
+            }
+        )
+    )
+    comps = inventory.build_inventory(crawl.crawl(tmp_path)[0], "2026-09-05T00:00:00Z")["components"]
+    by_purl = {c["purl"]: c for c in comps if c.get("purl")}
+    core = by_purl["pkg:npm/%40dicebear/core@9.2.2"]
+    assert core["group"] == "@dicebear"  # npm scope is the purl/component namespace
+    assert _component_property(core, "crimson:requirement") == "^9.2.2"
+    undici = by_purl["pkg:npm/undici@7.29.0"]
+    assert _component_property(undici, "crimson:requirement") == "^7.29.0"
+    exact = by_purl["pkg:npm/exact@1.2.3"]
+    assert _component_property(exact, "crimson:requirement") is None
+    # the nested undici entry (7.30.0) must not hijack the top-level pin
+    assert "pkg:npm/undici@7.30.0" not in by_purl
+
+
+def test_crawl_nested_manifest_uses_nearest_ancestor_lock(tmp_path):
+    (tmp_path / "uv.lock").write_text(
+        "version = 1\n"
+        "[[package]]\n"
+        'name = "httpx"\n'
+        'version = "0.27.0"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+    )
+    (tmp_path / "pyproject.toml").write_text('[project]\ndependencies = ["httpx>=0.27"]\n')
+    web = tmp_path / "packages" / "web"
+    web.mkdir(parents=True)
+    (web / "uv.lock").write_text(
+        "version = 1\n"
+        "[[package]]\n"
+        'name = "httpx"\n'
+        'version = "0.28.1"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+    )
+    (web / "pyproject.toml").write_text('[project]\ndependencies = ["httpx>=0.27"]\n')
+    other = tmp_path / "packages" / "other"
+    other.mkdir(parents=True)
+    (other / "uv.lock").write_text(
+        "version = 1\n"
+        "[[package]]\n"
+        'name = "httpx"\n'
+        'version = "0.99.0"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+    )
+    (other / "pyproject.toml").write_text('[project]\ndependencies = ["httpx>=0.27"]\n')
+    comps = inventory.build_inventory(crawl.crawl(tmp_path)[0], "2026-09-05T00:00:00Z")["components"]
+    httpx = [c for c in comps if c.get("name") == "httpx"]
+    # each manifest resolves against its own nearest ancestor lock: the root
+    # declaration against the root lock, the nested ones against their own
+    # tree locks — never a sibling tree's
+    assert {c.get("version") for c in httpx} == {"0.27.0", "0.28.1", "0.99.0"}
+    # and each resolved version keeps the requirement it was declared under
+    assert all(_component_property(c, "crimson:requirement") == ">=0.27" for c in httpx)
+
+
+def test_crawl_no_lock_preserves_constraint_only_output(tmp_path):
+    (tmp_path / "pyproject.toml").write_text('[project]\ndependencies = ["httpx>=0.28"]\n')
+    assets, _ = crawl.crawl(tmp_path)
+    doc = inventory.build_inventory(assets, "2026-09-05T00:00:00Z")
+    httpx = next(c for c in doc["components"] if c.get("name") == "httpx")
+    assert "version" not in httpx
+    assert httpx["purl"] == "pkg:pypi/httpx"
+    assert _component_property(httpx, "crimson:requirement") == ">=0.28"
+
+
+def test_crawl_lock_missing_name_falls_back_to_constraint_only(tmp_path):
+    (tmp_path / "pyproject.toml").write_text('[project]\ndependencies = ["httpx>=0.28"]\n')
+    (tmp_path / "uv.lock").write_text(
+        "version = 1\n"
+        "[[package]]\n"
+        'name = "requests"\n'
+        'version = "2.32.3"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+    )
+    doc = inventory.build_inventory(crawl.crawl(tmp_path)[0], "2026-09-05T00:00:00Z")
+    httpx = next(c for c in doc["components"] if c.get("name") == "httpx")
+    assert "version" not in httpx
+    assert _component_property(httpx, "crimson:requirement") == ">=0.28"

@@ -10,9 +10,11 @@ Two shapes live here. ``cti`` / ``d3fend`` / ``knowledgebase`` / ``poc`` /
 required positional. ``cve`` / ``kev`` / ``misp`` are pure filter endpoints where
 every field is optional — their positional (free-text query, CVE id, and
 attribute value respectively) is optional too, so a bare ``ccc search kev`` lists
-the catalog. ``search cve`` is the only one whose request model carries
-``include``, so it is the only one with an ``--include`` passthrough; there is no
-preset (the walk depth is the caller's to choose, matching ``search_techniques``).
+the catalog. ``cve`` / ``kev`` / ``misp`` and the query-shaped ``cti`` /
+``d3fend`` carry ``include`` on their request models, so each has an
+``--include`` passthrough; no search command has a preset (the walk depth,
+the corpus-statistics opt-in, and the ``sightings`` opt-in are the caller's to
+choose — matching ``search_techniques``).
 
 ``ccc search techniques`` and the deprecated top-level ``ccc search-techniques``
 alias share one implementation in :mod:`search_techniques`.
@@ -43,6 +45,20 @@ _CVE_PATTERN = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
 
 LimitOption = Annotated[int, typer.Option("--limit", min=1, max=100, help="Maximum number of results to return.")]
 PageOption = Annotated[int, typer.Option("--page", min=1, help="1-based result page.")]
+NoIncludesOption = Annotated[bool, typer.Option("--no-includes", help="Omit all optional result layers.")]
+
+
+def _search_includes(include: list[str] | None, no_includes: bool) -> list[str] | None:
+    if no_includes and include:
+        raise BadInputError("--no-includes cannot be combined with --include.")
+    return [] if no_includes else include
+
+
+class CSAFSort(str, Enum):
+    """Ordering for ``ccc search csaf --sort``."""
+
+    newest = "newest"
+    oldest = "oldest"
 
 
 class CTISource(str, Enum):
@@ -53,6 +69,8 @@ class CTISource(str, Enum):
     capec = "capec"
     atlas = "atlas"
     disarm = "disarm"
+    f3 = "f3"
+    cloak = "cloak"
 
 
 class CTIType(str, Enum):
@@ -90,6 +108,8 @@ class VulnStatus(str, Enum):
 
     analyzed = "Analyzed"
     awaiting_analysis = "Awaiting Analysis"
+    undergoing_analysis = "Undergoing Analysis"
+    deferred = "Deferred"
     modified = "Modified"
     received = "Received"
     rejected = "Rejected"
@@ -174,8 +194,16 @@ def cve_command(
     ] = None,
     include: Annotated[
         list[str] | None,
-        typer.Option("--include", help="Enrichment layer to add, repeatable (default: details).", show_default=False),
+        typer.Option(
+            "--include",
+            help="Result layers, repeatable; an explicit list replaces the server defaults. "
+            "Options: details, statistics (corpus coverage "
+            "+ freshness counts), cna (the CNA directory), epss_reports (daily EPSS history per returned "
+            "CVE), kb_rankings (top 100 per KB without trends), kb_rankings_full (all rows and trends).",
+            show_default=False,
+        ),
     ] = None,
+    no_includes: NoIncludesOption = False,
     limit: LimitOption = 50,
     page: PageOption = 1,
     _json: output.JsonFlag = False,
@@ -187,6 +215,7 @@ def cve_command(
     narrow on rather than sending a request the caller almost certainly did not
     mean. ``--limit``/``--page`` alone do not count as filters.
     """
+    include = _search_includes(include, no_includes)
     filters = (query, cve_id, cwe_id, attack_id, capec_id, cpe, cvss_min, epss_min, vuln_status)
     if not kev_only and all(value is None for value in filters):
         raise BadInputError("Pass a query or at least one filter (--cve-id, --cwe-id, --kev-only, …).")
@@ -230,12 +259,24 @@ def kev_command(
             show_default=False,
         ),
     ] = None,
+    include: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--include",
+            help="Result layers to use, repeatable; replaces the default ['statistics']. "
+            "Only 'statistics' is supported; use --no-includes for none. It reports deployment-wide "
+            "corpus coverage (CVE/KEV totals, per-year counts, and creation deltas).",
+            show_default=False,
+        ),
+    ] = None,
+    no_includes: NoIncludesOption = False,
     limit: LimitOption = 50,
     page: PageOption = 1,
     _json: output.JsonFlag = False,
     _expand: output.ExpandFlag = False,
 ) -> None:
     """Look up one CVE's KEV entry, or page the catalog with optional filters."""
+    include = _search_includes(include, no_includes)
     if cve_id is not None and not _CVE_PATTERN.match(cve_id):
         raise BadInputError(f"Malformed CVE id: {cve_id!r} (expected CVE-YYYY-NNNN…)")
     normalized = cve_id.upper() if cve_id else None
@@ -245,10 +286,61 @@ def kev_command(
         lambda client: client.search_kev(
             cve_id=normalized,
             ransomware_status=ransomware_status.value if ransomware_status else None,
+            include=include,
             limit=limit,
             page=page,
         ),
         partial(_formatters.render_search_kev, requested=label),
+    )
+
+
+@app.command("csaf", help="Search the seeded CSAF vendor-advisory corpus, including CVE-less advisories.")
+@handle_errors
+def csaf_command(
+    cve_id: Annotated[
+        str | None, typer.Option("--cve", help="Only advisories naming this CVE.", show_default=False)
+    ] = None,
+    advisory_id: Annotated[
+        str | None, typer.Option("--advisory-id", help="Exact CSAF tracking id.", show_default=False)
+    ] = None,
+    publisher: Annotated[
+        str | None, typer.Option("--publisher", help="Publisher name substring.", show_default=False)
+    ] = None,
+    sector: Annotated[
+        str | None, typer.Option("--sector", help="Exact critical-infrastructure sector.", show_default=False)
+    ] = None,
+    product: Annotated[
+        str | None, typer.Option("--product", help="Product-name substring.", show_default=False)
+    ] = None,
+    cpe: Annotated[str | None, typer.Option("--cpe", help="CPE substring.", show_default=False)] = None,
+    tlp: Annotated[str | None, typer.Option("--tlp", help="Exact TLP label.", show_default=False)] = None,
+    sort: Annotated[
+        CSAFSort, typer.Option("--sort", help="Order by current release date.", case_sensitive=False)
+    ] = CSAFSort.newest,
+    limit: LimitOption = 20,
+    page: PageOption = 1,
+    _json: output.JsonFlag = False,
+    _expand: output.ExpandFlag = False,
+) -> None:
+    """Search the CSAF corpus — the door for CVE-less advisories."""
+    if cve_id is not None and not _CVE_PATTERN.match(cve_id):
+        raise BadInputError(f"Malformed CVE id: {cve_id!r} (expected CVE-YYYY-NNNN…)")
+    label = f"CSAF advisories for {publisher}" if publisher else "the CSAF corpus"
+    _run_search(
+        label,
+        lambda client: client.search_csaf(
+            cve_id=cve_id.upper() if cve_id else None,
+            advisory_id=advisory_id,
+            publisher=publisher,
+            sector=sector,
+            product=product,
+            cpe=cpe,
+            tlp=tlp,
+            sort=sort.value,
+            limit=limit,
+            page=page,
+        ),
+        partial(_formatters.render_search_csaf, requested=label),
     )
 
 
@@ -269,6 +361,16 @@ def cti_command(
         list[CTIType] | None,
         typer.Option("--type", help="STIX object type, repeatable.", case_sensitive=False, show_default=False),
     ] = None,
+    include: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--include",
+            help="Extra response layer, repeatable. The only accepted value is 'kb_versions' — the "
+            "installed vs available revision of each requested knowledge base, so a content gap can be "
+            "told apart from a stale KB. Reported even when the search itself matches nothing.",
+            show_default=False,
+        ),
+    ] = None,
     limit: LimitOption = 20,
     page: PageOption = 1,
     _json: output.JsonFlag = False,
@@ -278,6 +380,9 @@ def cti_command(
 
     The broad sibling of ``ccc search techniques``, which is this endpoint
     pre-scoped to ATT&CK attack-patterns.
+
+    ``--include kb_versions`` answers "which KB revision answered me" — it is
+    read-only metadata about the deployment, not a result filter.
     """
     if not query.strip():
         raise BadInputError("Search query must not be empty.")
@@ -287,6 +392,7 @@ def cti_command(
             query,
             sources=[source.value for source in sources] if sources else None,
             types=[kind.value for kind in types] if types else None,
+            include=list(include) if include else None,
             limit=limit,
             page=page,
         ),
@@ -302,12 +408,23 @@ def d3fend_command(
         D3FENDForm | None,
         typer.Option("--form", help="Restrict to one D3FEND node kind.", case_sensitive=False, show_default=False),
     ] = None,
+    include: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--include",
+            help="Result layers to use, repeatable; replaces the default ['versions']. "
+            "Only 'versions' is supported; use --no-includes for none. It adds revision history.",
+            show_default=False,
+        ),
+    ] = None,
+    no_includes: NoIncludesOption = False,
     limit: LimitOption = 20,
     page: PageOption = 1,
     _json: output.JsonFlag = False,
     _expand: output.ExpandFlag = False,
 ) -> None:
     """Find the countermeasures that answer an offensive technique."""
+    include = _search_includes(include, no_includes)
     if not query.strip():
         raise BadInputError("Search query must not be empty.")
     _run_search(
@@ -317,6 +434,7 @@ def d3fend_command(
             d3fend_form=form.value if form else None,
             limit=limit,
             page=page,
+            include=include,
         ),
         partial(_formatters.render_search_d3fend, requested=f"'{query}'"),
     )
@@ -358,7 +476,7 @@ def knowledgebase_command(
     )
 
 
-@app.command("misp", help="Search MISP attributes and events by value, type, tag, event, or date range.")
+@app.command("misp", help="Search our curated MISP (public threat feeds) by value, type, tag, event, or date range.")
 @handle_errors
 def misp_command(
     value: Annotated[
@@ -405,6 +523,21 @@ def misp_command(
         str | None,
         typer.Option("--threat-level", help="MISP threat level id (1 = high … 4 = undefined).", show_default=False),
     ] = None,
+    include: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--include",
+            help="Result layers, repeatable; replaces the default event_reports, tags and version. "
+            "'sightings' makes MISP return the inline Sighting "
+            "array, so each attribute's (and each returned event's) sighting count is real rather than 0; "
+            "'event_reports' adds the analyst-written reports for the events the search resolved; 'stats' "
+            "adds per-event attribute/object/sighting counts; 'tags' the instance's tag vocabulary; "
+            "'feeds' the configured feed previews; 'objects' returns full events with resolved object "
+            "references; 'misp_events_full' returns full event bodies; 'version' the MISP version.",
+            show_default=False,
+        ),
+    ] = None,
+    no_includes: NoIncludesOption = False,
     limit: LimitOption = 50,
     page: PageOption = 1,
     _json: output.JsonFlag = False,
@@ -414,7 +547,11 @@ def misp_command(
 
     Every field on this endpoint is optional, so an unfiltered call would page
     the whole feed — require something to narrow on instead.
+
+    ``--include sightings`` fills in each attribute's sighting count; without it
+    every attribute comes back with a zero count.
     """
+    include = _search_includes(include, no_includes)
     filters = (value, type_attribute, category, event_id, eventinfo, tags, date_from, date_to, threat_level_id)
     if published is None and to_ids is None and all(item is None for item in filters):
         raise BadInputError("Pass a value or at least one filter (--type, --tag, --event-id, --date-from, …).")
@@ -434,6 +571,7 @@ def misp_command(
             published=published,
             to_ids=to_ids,
             threat_level_id=threat_level_id,
+            include=include,
             limit=limit,
             page=page,
         ),
@@ -464,21 +602,37 @@ def poc_command(
     )
 
 
-@app.command("vendor", help="List a vendor's products and CPE entries — the input to `ccc enrich product`.")
+@app.command(
+    "vendor",
+    help="List a vendor's products and CPE entries — or browse the vendor directory (omit VENDOR).",
+)
 @handle_errors
 def vendor_command(
-    vendor: Annotated[str, typer.Argument(help="Vendor name (e.g. apache, microsoft).", show_default=False)],
+    vendor: Annotated[
+        str | None,
+        typer.Argument(help="Vendor name (e.g. apache). Omit to list the vendor directory.", show_default=False),
+    ] = None,
+    q: Annotated[
+        str | None,
+        typer.Option("--q", help="Wildcard filter on vendor name (directory mode only).", show_default=False),
+    ] = None,
     limit: LimitOption = 50,
     _json: output.JsonFlag = False,
     _expand: output.ExpandFlag = False,
 ) -> None:
-    """Resolve a vendor's product catalog so product enrichment can name a real CPE."""
-    if not vendor.strip():
+    """Resolve a vendor's product catalog, or browse which vendors exist at all."""
+    if vendor is not None and not vendor.strip():
         raise BadInputError("Vendor name must not be empty.")
+    if vendor is None and q is None:
+        label = "vendor directory"
+    elif vendor is None:
+        label = f"vendors matching {q!r}"
+    else:
+        label = f"{vendor} products"
     _run_search(
-        f"{vendor} products",
-        lambda client: client.search_vendor(vendor, limit=limit),
-        partial(_formatters.render_search_vendor, requested=vendor),
+        label,
+        lambda client: client.search_vendor(vendor, q=q, limit=limit),
+        partial(_formatters.render_search_vendor, requested=label),
     )
 
 

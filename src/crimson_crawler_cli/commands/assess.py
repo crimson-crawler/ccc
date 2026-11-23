@@ -26,7 +26,8 @@ import typer
 from .. import auth, output
 from ..client_factory import build_client
 from ..exceptions import BadInputError, handle_errors
-from . import _formatters
+from . import _formatters, _includes
+from ._osv_walk import DEFAULT_MAX_BYTES, collect_osv_walk
 
 app = typer.Typer(
     name="assess",
@@ -58,13 +59,23 @@ _STAKEHOLDER_FIELDS: dict[str, tuple[str, ...]] = {
     "public_wellbeing_impact": ("minimal", "material", "irreversible"),
 }
 
-IncludeOption = Annotated[
+GROUPIncludeOption = Annotated[
+    list[str] | None, typer.Option("--include", help=_includes.describe("ASSESS_GROUP"), show_default=False)
+]
+IOCIncludeOption = Annotated[
     list[str] | None,
     typer.Option(
         "--include",
-        help="Response layer to include, repeatable (default: the server's).",
+        help=_includes.describe("ASSESS_IOC")
+        + " Use galaxies for full profiles; galaxy_clusters_full is enrich/ioc only.",
         show_default=False,
     ),
+]
+TECHNIQUEIncludeOption = Annotated[
+    list[str] | None, typer.Option("--include", help=_includes.describe("ASSESS_TECHNIQUE"), show_default=False)
+]
+VULNERABILITYIncludeOption = Annotated[
+    list[str] | None, typer.Option("--include", help=_includes.describe("ASSESS_VULN"), show_default=False)
 ]
 
 
@@ -206,7 +217,7 @@ def group_exposure_command(
         typer.Option("--search", help="Group name or alias (e.g. APT28), repeatable.", show_default=False),
     ] = None,
     framework: FrameworkOption = Framework.enterprise,
-    include: IncludeOption = None,
+    include: GROUPIncludeOption = None,
     _json: output.JsonFlag = False,
     _expand: output.ExpandFlag = False,
 ) -> None:
@@ -219,16 +230,32 @@ def group_exposure_command(
         raise BadInputError("Pass at least one --group-id or --search.")
     normalized = _validate_ids(group_ids, _GROUP_PATTERN, label="group id") if group_ids else None
     label = ", ".join(normalized or search or [])
-    _run_assess(
-        label,
-        lambda client: client.assess_group_exposure(
-            group_ids=normalized,
-            search=search,
-            framework=framework.value,
-            include=include,
-        ),
-        _formatters.render_assess_group_exposure,
-    )
+    resolved = auth.resolve_auth()
+
+    async def _call() -> dict[str, Any]:
+        async with build_client(resolved) as client:
+            payload: dict[str, Any] | None = None
+            async for response in client.iter_group_exposure_pages(
+                group_ids=normalized, search=search, framework=framework.value, include=include
+            ):
+                page = response.to_dict()
+                if payload is None:
+                    payload = page
+                    continue
+                payload["techniques"].extend(page["techniques"])
+                payload["paging_incomplete"] = bool(payload.get("paging_incomplete") or page.get("paging_incomplete"))
+                for error in page.get("errors") or []:
+                    if error not in payload["errors"]:
+                        payload["errors"].append(error)
+            if payload is None:
+                raise ValueError("Group exposure returned no pages")
+            payload["techniques_next_offset"] = None
+            payload["log_source_catalog"] = []
+            payload["log_source_refs"] = {}
+            return payload
+
+    payload = _formatters.with_status(f"Assessing {label}…", _call())
+    output.render(payload, _formatters.render_assess_group_exposure)
 
 
 @app.command("ioc-portfolio", help="Assess up to 50 indicators at once — MISP hits, shared techniques, actors.")
@@ -253,7 +280,7 @@ def ioc_portfolio_command(
             show_default=False,
         ),
     ] = None,
-    include: IncludeOption = None,
+    include: IOCIncludeOption = None,
     _json: output.JsonFlag = False,
     _expand: output.ExpandFlag = False,
 ) -> None:
@@ -279,7 +306,7 @@ def technique_coverage_command(
         typer.Argument(help="ATT&CK technique ids (e.g. T1190 T1059.001).", show_default=False),
     ],
     framework: FrameworkOption = Framework.enterprise,
-    include: IncludeOption = None,
+    include: TECHNIQUEIncludeOption = None,
     _json: output.JsonFlag = False,
     _expand: output.ExpandFlag = False,
 ) -> None:
@@ -312,26 +339,36 @@ def vulnerability_exposure_command(
             show_default=False,
         ),
     ] = None,
-    include: IncludeOption = None,
+    include: VULNERABILITYIncludeOption = None,
+    max_bytes: Annotated[
+        int,
+        typer.Option(
+            "--max-bytes", min=1, help="Maximum collected OSV walk result bytes (compact UTF-8 JSON, not RSS)."
+        ),
+    ] = DEFAULT_MAX_BYTES,
     _json: output.JsonFlag = False,
     _expand: output.ExpandFlag = False,
 ) -> None:
     """Assess a CVE portfolio and rank its remediation.
 
     ``--stakeholder`` supplies the SSVC decision context; omit it entirely and
-    the API's own defaults apply.
+    the API's own defaults apply. OSV advisories are aggregated across the CVEs and paged behind a
+    snapshot cursor; the command follows it to the end under ``--max-bytes`` and prints nothing if
+    the ceiling or the snapshot is lost mid-walk.
     """
     normalized = _validate_ids(list(cve_ids), _CVE_PATTERN, label="CVE id")
     profile = _parse_stakeholder(stakeholder)
-    _run_assess(
-        f"{len(normalized)} CVEs",
-        lambda client: client.assess_vulnerability_exposure(
-            normalized,
-            stakeholder=profile,
-            include=include,
-        ),
-        _formatters.render_assess_vulnerability_exposure,
-    )
+    resolved = auth.resolve_auth()
+
+    async def _call() -> dict[str, Any]:
+        async with build_client(resolved) as client:
+            return await collect_osv_walk(
+                client.iter_vulnerability_exposure_osv_pages(normalized, stakeholder=profile, include=include),
+                max_bytes=max_bytes,
+            )
+
+    payload = _formatters.with_status(f"Assessing {len(normalized)} CVEs…", _call())
+    output.render(payload, _formatters.render_assess_vulnerability_exposure)
 
 
 __all__ = [

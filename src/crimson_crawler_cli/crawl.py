@@ -34,6 +34,7 @@ from defusedxml.ElementTree import fromstring as _xml_fromstring
 from . import inventory
 
 _asset = inventory.asset
+_normalize_package = inventory.normalize_package
 
 
 def _as_dict(value) -> dict:
@@ -324,6 +325,125 @@ def detect_sentinel(filename: str) -> list[dict]:
 
 
 # ============================================================
+# Lockfile-backed version resolution (#349)
+# ============================================================
+#
+# Mirrors the two lock readers in scripts/generate-public-sbom.py (uv.lock
+# + package-lock.json) but indexes ALL pinned packages once, so every
+# declared dependency resolves against the nearest ancestor lock in one
+# pass instead of one regex per wanted name. Poetry's lock writes the same
+# ``[[package]] name/version`` shape as uv's (without uv's source line), so
+# one reader serves both. pnpm-lock.yaml / yarn.lock / Pipfile.lock /
+# Cargo.lock stay sentinel-only (they are not read; their formats are
+# YAML/JSON-versioned and would need their own readers — declared in
+# docs/CYCLONEDX-INVENTORY-SPEC.md).
+
+_LOCKFILE_KINDS = {
+    "uv.lock": {"pypi", "poetry"},
+    "poetry.lock": {"pypi", "poetry"},
+    "package-lock.json": {"npm"},
+}
+
+
+def _index_uv_lock(text: str) -> dict[str, str]:
+    """[[package]] name/version blocks → {PEP 503 name: version}.
+
+    Covers both lock shapes that write them: uv.lock (``source = { registry
+    ... }`` directly under the version) and poetry.lock (no source line at
+    all — registry is implied). Only registry packages are indexed:
+    git/editable dependencies (``source = { git = ... }`` /
+    ``{ editable = ... }`` / a path or url source) have no pinned registry
+    version and must not shadow a registry one, so a block whose source line
+    mentions git/editable/url/path/directory/virtual is skipped.
+    """
+    index: dict[str, str] = {}
+    head_re = re.compile(r"^\[\[package\]\]\nname = \"([^\"]+)\"\nversion = \"([^\"]+)\"", re.MULTILINE)
+    for m in head_re.finditer(text):
+        rest = text[m.end() :]
+        next_block = rest.find("[[package]]")
+        if next_block != -1:
+            rest = rest[:next_block]
+        source_match = re.search(r"source = \{([^}]*)\}", rest)
+        if source_match and re.search(r"\b(git|editable|url|path|directory|virtual)\b", source_match.group(1)):
+            continue
+        index[re.sub(r"[-_.]+", "-", m.group(1).casefold())] = m.group(2)
+    return index
+
+
+def _index_npm_lock(text: str) -> dict[str, str]:
+    """package-lock.json ``packages["node_modules/<name>"].version`` map.
+
+    The ``node_modules/`` prefix is the real install location, so a scoped
+    name stays intact (``node_modules/@dicebear/core`` → ``@dicebear/core``).
+    Nested copies (``node_modules/a/node_modules/b``) are deliberately NOT
+    indexed: the sole reader resolves a BARE package name (``_lock_version``
+    → ``_normalize_package``), so a ``a/node_modules/b`` key could never be
+    looked up, and re-keying it to ``b`` would let a depth-specific copy
+    shadow the hoisted top-level pin that a bare-name lookup means. Lockfile
+    v1 (no ``packages``) yields no index. Names are kept exact (npm is
+    case-sensitive).
+    """
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    index: dict[str, str] = {}
+    for key, entry in _as_dict(data.get("packages")).items():
+        if not key.startswith("node_modules/"):
+            continue
+        name = key[len("node_modules/") :]
+        if "node_modules/" in name:
+            continue  # nested copy — unreachable by bare-name lookup (see docstring)
+        if isinstance(entry, dict) and isinstance(entry.get("version"), str):
+            index[name] = entry["version"]
+    return index
+
+
+def _lock_version(
+    resolve: Callable[[str], str | None] | None,
+    name: str,
+    declared: str,
+    ecosystem: str,
+) -> str:
+    """The version a manifest dependency carries: the lockfile-pinned concrete
+    version when the nearest ancestor lock pins it, otherwise the declared
+    spec unchanged.
+
+    ``resolve`` is the parser's bound lock lookup (declared-name → pinned
+    version, ``None`` when no lock or no pin). Resolution replaces anything
+    that is not already a concrete pin — a constraint (``>=2.31``,
+    ``>=0.109.0,<1.0.0``), a wildcard (``*``) or a bare name
+    (``'unknown'``) — mirroring generate-public-sbom.py, which resolves
+    every declared runtime dependency. An exact/bare pin (``==0.110.0``,
+    ``0.110.0``) is already concrete — judged on the CLEANED spec, since
+    ``==2.12.4`` cleans to a concrete version — and stays as declared: an
+    ancestor lock must never rewrite a pin the manifest made explicit. A
+    lock that does not pin the name leaves the declared spec untouched
+    (constraint-only component, as before).
+    """
+    if resolve is None or not declared:
+        return declared
+    if declared not in ("unknown", "*") and inventory.is_concrete_version(inventory.clean_version(declared)):
+        return declared
+    pinned = resolve(_normalize_package(name, ecosystem))
+    return pinned if pinned is not None else declared
+
+
+def _declared_requirement(declared: str) -> str | None:
+    """The ``crimson:requirement`` a declaration earns: the spec itself when
+    it is a real constraint (``>=2.31`` — the emitted version only becomes
+    concrete through a lock), else ``None``. Exact/bare pins (``==2.12.4``)
+    and empty declarations (``'unknown'`` / ``*`` — nothing was constrained)
+    emit no requirement property, exactly as they always did."""
+    cleaned = inventory.clean_version(declared)
+    if cleaned == "unknown" or cleaned[0] not in inventory._CONSTRAINT_LEAD:
+        return None
+    return declared
+
+
+# ============================================================
 # Requirements line parser (shared)
 # ============================================================
 
@@ -377,7 +497,7 @@ def _parse_requirements_line(line: str) -> tuple[str, str] | None:
 # ============================================================
 
 
-def parse_pyproject_toml(path: Path) -> list[dict]:
+def parse_pyproject_toml(path: Path, resolve: Callable[[str], str | None] | None = None) -> list[dict]:
     text = _read(path)
     if text is None:
         return []
@@ -414,9 +534,10 @@ def parse_pyproject_toml(path: Path) -> list[dict]:
                     "package",
                     name,
                     None,
-                    [ver],
-                    f"detected from {rel} [project.dependencies]",
+                    versions=[_lock_version(resolve, name, ver, "PyPI")],
+                    note=f"detected from {rel} [project.dependencies]",
                     ecosystem="PyPI",
+                    requirement=_declared_requirement(ver),
                 )
             )
 
@@ -435,9 +556,10 @@ def parse_pyproject_toml(path: Path) -> list[dict]:
                         "package",
                         name,
                         None,
-                        [ver],
-                        f"detected from {rel} [project.optional-dependencies.{group}]",
+                        versions=[_lock_version(resolve, name, ver, "PyPI")],
+                        note=f"detected from {rel} [project.optional-dependencies.{group}]",
                         ecosystem="PyPI",
+                        requirement=_declared_requirement(ver),
                     )
                 )
 
@@ -456,9 +578,10 @@ def parse_pyproject_toml(path: Path) -> list[dict]:
                         "package",
                         name,
                         None,
-                        [ver],
-                        f"detected from {rel} [dependency-groups.{group}]",
+                        versions=[_lock_version(resolve, name, ver, "PyPI")],
+                        note=f"detected from {rel} [dependency-groups.{group}]",
                         ecosystem="PyPI",
+                        requirement=_declared_requirement(ver),
                     )
                 )
 
@@ -474,9 +597,10 @@ def parse_pyproject_toml(path: Path) -> list[dict]:
                     "package",
                     name,
                     None,
-                    [ver],
-                    f"detected from {rel} [build-system.requires]",
+                    versions=[_lock_version(resolve, name, ver, "PyPI")],
+                    note=f"detected from {rel} [build-system.requires]",
                     ecosystem="PyPI",
+                    requirement=_declared_requirement(ver),
                 )
             )
 
@@ -499,9 +623,10 @@ def parse_pyproject_toml(path: Path) -> list[dict]:
                 "package",
                 name,
                 None,
-                [ver],
-                f"detected from {rel} [tool.poetry.dependencies]",
+                versions=[_lock_version(resolve, name, ver, "PyPI")],
+                note=f"detected from {rel} [tool.poetry.dependencies]",
                 ecosystem="PyPI",
+                requirement=_declared_requirement(ver),
             )
         )
     for group_name, group_data in _as_dict(poetry.get("group")).items():
@@ -515,9 +640,10 @@ def parse_pyproject_toml(path: Path) -> list[dict]:
                     "package",
                     name,
                     None,
-                    [ver],
-                    f"detected from {rel} [tool.poetry.group.{group_name}.dependencies]",
+                    versions=[_lock_version(resolve, name, ver, "PyPI")],
+                    note=f"detected from {rel} [tool.poetry.group.{group_name}.dependencies]",
                     ecosystem="PyPI",
+                    requirement=_declared_requirement(ver),
                 )
             )
     return assets
@@ -542,7 +668,7 @@ def _poetry_version(spec) -> str:
 # ============================================================
 
 
-def parse_requirements_txt(path: Path) -> list[dict]:
+def parse_requirements_txt(path: Path, resolve: Callable[[str], str | None] | None = None) -> list[dict]:
     text = _read(path)
     if text is None:
         return []
@@ -557,9 +683,10 @@ def parse_requirements_txt(path: Path) -> list[dict]:
                     "package",
                     name,
                     None,
-                    [ver],
-                    f"detected from {rel}",
+                    versions=[_lock_version(resolve, name, ver, "PyPI")],
+                    note=f"detected from {rel}",
                     ecosystem="PyPI",
+                    requirement=_declared_requirement(ver),
                 )
             )
     return assets
@@ -609,7 +736,7 @@ def parse_pipfile(path: Path) -> list[dict]:
 # ============================================================
 
 
-def parse_package_json(path: Path) -> list[dict]:
+def parse_package_json(path: Path, resolve: Callable[[str], str | None] | None = None) -> list[dict]:
     text = _read(path)
     if text is None:
         return []
@@ -626,14 +753,16 @@ def parse_package_json(path: Path) -> list[dict]:
         sections.append("devDependencies")
     for section in sections:
         for name, ver in _as_dict(data.get(section)).items():
+            declared = str(ver) if ver else "unknown"
             assets.append(
                 _asset(
                     "package",
                     name,
                     None,
-                    [str(ver) if ver else "unknown"],
-                    f"detected from {rel} [{section}]",
+                    versions=[_lock_version(resolve, name, declared, "npm")],
+                    note=f"detected from {rel} [{section}]",
                     ecosystem="npm",
+                    requirement=_declared_requirement(declared),
                 )
             )
     engines = _as_dict(data.get("engines"))
@@ -1309,16 +1438,59 @@ def _is_requirements_file(path: Path) -> bool:
     return False
 
 
+def _manifest_ecosystem(path: Path) -> str:
+    """Ecosystem a manifest's dependencies belong to — selects which
+    lockfile kinds can resolve them (PyPI vs npm)."""
+    name = path.name
+    if name == "package.json":
+        return "npm"
+    if name == "pyproject.toml" or _is_requirements_file(path):
+        return "pypi"
+    return ""
+
+
+def _lock_resolver(path: Path, ecosystem: str) -> Callable[[str], str | None] | None:
+    """Resolve manifest dependency names against the nearest ancestor lock.
+
+    Walks up from the manifest's directory to the crawl root; the FIRST lock
+    of a kind usable for *ecosystem* wins, so a nested manifest resolves
+    against its own tree's lock (``client-ts/package.json`` → the
+    ``client-ts/`` lock, never the portal's). The lock text is read through
+    ``_read``, so an oversized or symlinked lock degrades to no resolution
+    rather than aborting the crawl.
+    """
+    root = _CURRENT_TARGET
+    if root is None:
+        return None
+    for directory in [path.parent, *path.parent.parents]:
+        if root not in directory.parents and directory != root:
+            break
+        for lock_name in _LOCKFILE_KINDS:
+            if ecosystem not in _LOCKFILE_KINDS[lock_name]:
+                continue
+            lock_path = directory / lock_name
+            if not lock_path.is_file():
+                continue
+            text = _read(lock_path)
+            if text is None:
+                return None
+            index: dict[str, str] = _index_npm_lock(text) if lock_name == "package-lock.json" else _index_uv_lock(text)
+            return index.get
+    return None
+
+
 def _dispatch(path: Path) -> list[dict]:
     name = path.name
     assets: list[dict] = []
     assets.extend(detect_sentinel(name))
+    ecosystem = _manifest_ecosystem(path)
+    resolve = _lock_resolver(path, ecosystem) if ecosystem else None
     if name == "pyproject.toml":
-        assets.extend(parse_pyproject_toml(path))
+        assets.extend(parse_pyproject_toml(path, resolve))
     elif name == "Pipfile":
         assets.extend(parse_pipfile(path))
     elif name == "package.json":
-        assets.extend(parse_package_json(path))
+        assets.extend(parse_package_json(path, resolve))
     elif name == "Cargo.toml":
         assets.extend(parse_cargo_toml(path))
     elif name == "go.mod":
@@ -1341,7 +1513,7 @@ def _dispatch(path: Path) -> list[dict]:
         assets.extend(parse_tool_versions(path))
     elif _is_requirements_file(path):
         if not (EXCLUDE_DEV and _is_dev_requirements(path)):
-            assets.extend(parse_requirements_txt(path))
+            assets.extend(parse_requirements_txt(path, resolve))
     return assets
 
 

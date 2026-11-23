@@ -22,6 +22,7 @@ from rich.table import Table
 from .. import auth, output, paths
 from ..client_factory import build_client
 from ..exceptions import BadInputError, handle_errors
+from ..tlp import tlp_named_option, tlp_option, tlp_value
 from ._formatters import with_status
 
 app = typer.Typer(
@@ -75,6 +76,7 @@ def _render_artifacts(console: Console, payload: dict[str, Any]) -> None:
     table.add_column("ID", overflow="fold")
     table.add_column("Kind")
     table.add_column("Name", overflow="fold")
+    table.add_column("TLP")
     table.add_column("Size", justify="right")
     table.add_column("★", justify="center")
     table.add_column("Created")
@@ -83,6 +85,7 @@ def _render_artifacts(console: Console, payload: dict[str, Any]) -> None:
             escape(str(a.get("id", ""))),
             escape(str(a.get("kind", ""))),
             escape(str(a.get("name", ""))),
+            escape(str(a.get("tlp", ""))),
             _fmt_bytes(a.get("byte_size")),
             "★" if a.get("favorite") else "",
             escape(str(a.get("created_at", ""))[:19]),
@@ -101,6 +104,14 @@ def list_command(
         str | None,
         typer.Option("--folder", help="A folder id, or __root__ for un-filed artifacts."),
     ] = None,
+    search: Annotated[
+        str | None,
+        typer.Option("--search", help="Match names and contents (uploaded files match on their text)."),
+    ] = None,
+    tlp: Annotated[
+        str | None,
+        tlp_option("Filter by TLP 2.0 marking."),
+    ] = None,
 ) -> None:
     """List the caller's artifacts via ``client.artifact_manager.list_artifacts``."""
     resolved = auth.resolve_auth()
@@ -110,6 +121,8 @@ def list_command(
             artifacts = await client.artifact_manager.list_artifacts(
                 kind=kind.value if kind else None,
                 folder=folder,
+                search=search,
+                tlp=tlp_value(tlp),
             )
             return {"artifacts": artifacts}
 
@@ -134,11 +147,19 @@ def _render_upload(console: Console, payload: dict[str, Any]) -> None:
 def upload_command(
     file_paths: Annotated[
         list[Path],
-        typer.Argument(help="Files to upload (text uploads as paste, binary as base64).", show_default=False),
+        typer.Argument(
+            help="Files to upload: PDF, Word, PowerPoint, Excel/CSV, EML, HTML, scan XML, JSON, or any text "
+            "(text uploads as paste, binary as base64; images are not read).",
+            show_default=False,
+        ),
     ],
     folder_name: Annotated[
         str | None,
         typer.Option("--folder", help="File the uploads into this folder (created if missing)."),
+    ] = None,
+    tlp: Annotated[
+        str | None,
+        tlp_option("TLP 2.0 marking applied to every uploaded artifact (default: AMBER)."),
     ] = None,
 ) -> None:
     """Upload one or more files via ``client.artifact_manager.upload_artifacts``."""
@@ -172,7 +193,9 @@ def upload_command(
 
     async def _call() -> dict[str, Any]:
         async with build_client(resolved) as client:
-            return await client.artifact_manager.upload_artifacts(artifacts, new_folder_name=folder_name)
+            return await client.artifact_manager.upload_artifacts(
+                artifacts, new_folder_name=folder_name, tlp=tlp_value(tlp)
+            )
 
     payload = with_status(f"Uploading {len(artifacts)} artifact(s)…", _call())
     output.render(payload, _render_upload)
@@ -202,7 +225,7 @@ def get_command(
     raw = with_status("Fetching artifact…", _call())
     if out is not None:
         paths.write_atomic(out, raw["content"])
-        summary = {k: raw[k] for k in ("id", "kind", "name", "format", "mime")}
+        summary = {k: raw[k] for k in ("id", "kind", "name", "format", "mime", "tlp")}
         summary["saved_to"] = str(out)
         summary["bytes"] = len(raw["content"].encode())
         output.render(
@@ -274,6 +297,14 @@ def export_command(
         Path | None,
         typer.Option("--output", "-o", help="Output path (default: the export's own filename, e.g. stix.json)."),
     ] = None,
+    tlp: Annotated[
+        str | None,
+        tlp_option(
+            "TLP 2.0 marking written into the export, overriding the artifact's stored TLP "
+            "(default: its own stored TLP). Formats without a marking slot "
+            "(openvex, csv, emass) ignore it."
+        ),
+    ] = None,
 ) -> None:
     """Download one export via ``client.artifact_manager.get_export``."""
     if out is not None:
@@ -282,7 +313,7 @@ def export_command(
 
     async def _call() -> dict[str, Any]:
         async with build_client(resolved) as client:
-            return await client.artifact_manager.get_export(enrichment_id, format)
+            return await client.artifact_manager.get_export(enrichment_id, format, tlp=tlp_value(tlp))
 
     exp = with_status(f"Downloading {format} export…", _call())
     target = out if out is not None else _safe_response_filename(exp["filename"], f"{enrichment_id}.{format}")
@@ -313,6 +344,13 @@ def export_all_command(
         Path | None,
         typer.Option("--output", "-o", help="Output path (default: <id>-exports.zip)."),
     ] = None,
+    tlp: Annotated[
+        str | None,
+        tlp_option(
+            "TLP 2.0 marking written into each export, overriding the artifact's stored TLP "
+            "(default: its own stored TLP)."
+        ),
+    ] = None,
 ) -> None:
     """Download every machine export as one .zip via ``client.artifact_manager.download_all_exports``."""
     target = out if out is not None else Path(f"{enrichment_id}-exports.zip")
@@ -321,7 +359,7 @@ def export_all_command(
 
     async def _call() -> bytes:
         async with build_client(resolved) as client:
-            return await client.artifact_manager.download_all_exports(enrichment_id)
+            return await client.artifact_manager.download_all_exports(enrichment_id, tlp=tlp_value(tlp))
 
     data = with_status("Downloading all exports…", _call())
     target = out if out is not None else Path(f"{enrichment_id}-exports.zip")
@@ -358,7 +396,12 @@ def _render_matrix(console: Console, payload: dict[str, Any]) -> None:
     for col in columns:
         table.add_column(escape(str(col.get("name", ""))[:24]), justify="right")
     for row in rows:
-        cells = ["—" if c is None else escape(str(c.get("score", "·"))) for c in row.get("cells", [])]
+        cells = [
+            "—"
+            if c is None
+            else escape(f"{c.get('score', '·')}{' KEV' if c.get('kev') else ''}{' MSF' if c.get('weaponized') else ''}")
+            for c in row.get("cells", [])
+        ]
         table.add_row(escape(str(row.get("value", ""))), escape(str(row.get("status", ""))), *cells)
     console.print(table)
 
@@ -586,7 +629,7 @@ def delete_folder_command(
 # -- update ----------------------------------------------------------------- #
 
 
-@app.command("update", help="Rename, star/unstar, or move an artifact between folders.")
+@app.command("update", help="Rename, star/unstar, move an artifact between folders, or set its TLP.")
 @handle_errors
 def update_command(
     artifact_id: Annotated[str, typer.Argument(help="Artifact id.", show_default=False)],
@@ -594,17 +637,23 @@ def update_command(
     favorite: Annotated[bool | None, typer.Option("--favorite/--no-favorite", help="Star or unstar.")] = None,
     folder: Annotated[str | None, typer.Option("--folder", help="Move into this folder id.")] = None,
     root: Annotated[bool, typer.Option("--root", help="Move back to root (no folder).")] = False,
+    tlp: Annotated[
+        str | None,
+        tlp_option("New TLP 2.0 marking for the artifact."),
+    ] = None,
 ) -> None:
-    """Partial update via ``client.artifact_manager.update_artifact`` (rename / favorite / move)."""
+    """Partial update via ``client.artifact_manager.update_artifact`` (rename / favorite / move / TLP)."""
     if root and folder is not None:
         raise BadInputError("Pass either --folder or --root, not both.")
-    if name is None and favorite is None and folder is None and not root:
-        raise BadInputError("Nothing to update — pass --name, --favorite/--no-favorite, --folder, or --root.")
+    if name is None and favorite is None and folder is None and not root and tlp is None:
+        raise BadInputError("Nothing to update — pass --name, --favorite/--no-favorite, --folder, --root, or --tlp.")
     kwargs: dict[str, Any] = {}
     if name is not None:
         kwargs["name"] = name
     if favorite is not None:
         kwargs["favorite"] = favorite
+    if tlp is not None:
+        kwargs["tlp"] = tlp_value(tlp)
     if root:
         kwargs["folder_id"] = None
     elif folder is not None:
@@ -652,6 +701,13 @@ def download_folder_command(
         Path | None,
         typer.Option("--output", "-o", help="Output path (default: <folder>.zip)."),
     ] = None,
+    tlp: Annotated[
+        str | None,
+        tlp_option(
+            "TLP 2.0 marking written into each wrapped export, overriding each artifact's stored TLP "
+            "(default: each artifact's own stored TLP)."
+        ),
+    ] = None,
 ) -> None:
     """Download a whole folder as one .zip via ``client.artifact_manager.download_folder``."""
     target = out if out is not None else Path(f"{folder_id}-folder.zip")
@@ -660,7 +716,7 @@ def download_folder_command(
 
     async def _call() -> bytes:
         async with build_client(resolved) as client:
-            return await client.artifact_manager.download_folder(folder_id)
+            return await client.artifact_manager.download_folder(folder_id, tlp=tlp_value(tlp))
 
     data = with_status("Downloading folder…", _call())
     target = out if out is not None else Path(f"{folder_id}-folder.zip")
@@ -679,6 +735,13 @@ def download_bundle_command(
         Path | None,
         typer.Option("--output", "-o", help="Output path (default: artifacts.zip)."),
     ] = None,
+    tlp: Annotated[
+        str | None,
+        tlp_option(
+            "TLP 2.0 marking written into each wrapped export, overriding each artifact's stored TLP "
+            "(default: each artifact's own stored TLP)."
+        ),
+    ] = None,
 ) -> None:
     """Bundle the given artifacts into one .zip via ``client.artifact_manager.download_bundle``."""
     target = out if out is not None else Path("artifacts.zip")
@@ -687,7 +750,7 @@ def download_bundle_command(
 
     async def _call() -> bytes:
         async with build_client(resolved) as client:
-            return await client.artifact_manager.download_bundle(artifact_ids)
+            return await client.artifact_manager.download_bundle(artifact_ids, tlp=tlp_value(tlp))
 
     data = with_status("Bundling artifacts…", _call())
     target = out if out is not None else Path("artifacts.zip")
@@ -749,6 +812,64 @@ def rating_command(
         payload = with_status("Setting rating…", _call())
 
     output.render(payload, _render_rating)
+
+
+# -- enricher settings ------------------------------------------------------ #
+
+
+def _render_settings(console: Console, payload: dict[str, Any]) -> None:
+    for label, key in (("Artifact", "artifact_tlp"), ("Inventory", "inventory_tlp")):
+        console.print(f"Default TLP for new [bold]{label}[/bold] enrichments: {escape(str(payload.get(key) or '—'))}")
+
+
+@app.command("settings", help="Show or set the default TLP marking for NEW enrichments.")
+@handle_errors
+def settings_command(
+    artifact_tlp: Annotated[
+        str | None,
+        tlp_named_option(
+            "--artifact-tlp",
+            "Default marking for new ARTIFACT enrichments (omit to leave it unchanged).",
+        ),
+    ] = None,
+    inventory_tlp: Annotated[
+        str | None,
+        tlp_named_option(
+            "--inventory-tlp",
+            "Default marking for new INVENTORY enrichments (omit to leave it unchanged).",
+        ),
+    ] = None,
+) -> None:
+    """Show your enricher settings, or set one/both via ``client.artifact_manager.get_enricher_settings`` /
+    ``set_enricher_settings``.
+
+    The value is the BASELINE of a new enrichment, not an override: an enrichment built from more restrictive
+    artifacts is still marked at least that restrictively, and an explicit ``--tlp`` on an enrichment submit
+    overrides the default for that run's exports."""
+    resolved = auth.resolve_auth()
+    artifact, inventory = tlp_value(artifact_tlp), tlp_value(inventory_tlp)
+
+    if artifact is None and inventory is None:
+
+        async def _get() -> dict[str, Any]:
+            async with build_client(resolved) as client:
+                return await client.artifact_manager.get_enricher_settings()
+
+        payload = with_status("Fetching enricher settings…", _get())
+    else:
+        kwargs: dict[str, Any] = {}
+        if artifact is not None:
+            kwargs["artifact_tlp"] = artifact
+        if inventory is not None:
+            kwargs["inventory_tlp"] = inventory
+
+        async def _set() -> dict[str, Any]:
+            async with build_client(resolved) as client:
+                return await client.artifact_manager.set_enricher_settings(**kwargs)
+
+        payload = with_status("Setting enricher settings…", _set())
+
+    output.render(payload, _render_settings)
 
 
 __all__ = ["app"]

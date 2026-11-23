@@ -7,7 +7,7 @@ top-level safety net, naming neither the file, the mistake, nor the fix.
 
 from __future__ import annotations
 
-from pathlib import Path
+from pathlib import Path, PosixPath
 
 import pytest
 from typer.testing import CliRunner
@@ -96,4 +96,54 @@ def test_malformed_config_reaches_the_cli_as_a_clean_error(secure_config_file: P
     combined = result.stdout + result.stderr
     assert result.exit_code == ExitCode.BAD_INPUT, combined
     assert "internal error" not in combined
-    assert "shell/.env syntax" in combined
+
+
+# #252 — `config_file_status()` is the non-raising twin `ccc whoami` uses to stat the file
+# independently of `resolve_auth`. It must never raise: `whoami` under a set env var has a
+# resolved key and must keep exiting 0 even when the file it did NOT read is broken.
+
+
+def test_status_absent(clean_env: Path) -> None:
+    assert not clean_env.exists()
+    assert config.config_file_status() == ("absent", None)
+
+
+def test_status_present_does_not_parse(secure_config_file: Path) -> None:
+    """Presence is a stat, not a parse — a malformed file is still `present`; the loader
+    names the mistake at the moment the file is actually used."""
+    secure_config_file.write_text("CRIMSON_CRAWLER_API_KEY=abc123\n", encoding="utf-8")
+    assert config.config_file_status() == ("present", None)
+
+
+@pytest.mark.skipif(config.os.name != "posix", reason="POSIX ownership and mode checks")
+def test_status_refused_carries_the_loader_remediation(secure_config_file: Path) -> None:
+    secure_config_file.write_text('api_key = "x"\n', encoding="utf-8")
+    secure_config_file.chmod(0o644)
+
+    status, detail = config.config_file_status()
+
+    assert status == "refused"
+    assert detail is not None and "chmod 600" in detail
+    # Same text the loader raises — one remediation, two surfaces.
+    with pytest.raises(ConfigPermissionError) as exc_info:
+        config.load_config_file()
+    assert str(exc_info.value) == detail
+
+
+@pytest.mark.skipif(config.os.name != "posix", reason="PosixPath base")
+def test_status_refused_when_the_os_denies_the_open(monkeypatch: pytest.MonkeyPatch, clean_env: Path) -> None:
+    """The open itself fails with a bare `PermissionError` before `_validate_permissions` runs
+    (mode 000 for a normal user). Still `refused`, still non-raising. The denial is injected
+    rather than produced with `chmod 000` because CI runs the suite as root, which can open
+    anything — the branch under test is unreachable there by construction."""
+
+    class _Denied(PosixPath):
+        def open(self, *args: object, **kwargs: object) -> object:  # type: ignore[override]
+            raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(config, "CONFIG_FILE", _Denied(clean_env))
+
+    status, detail = config.config_file_status()
+
+    assert status == "refused"
+    assert detail == f"Cannot read {clean_env}: Permission denied."

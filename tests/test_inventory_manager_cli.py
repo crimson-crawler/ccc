@@ -32,11 +32,12 @@ def authed(monkeypatch: pytest.MonkeyPatch, clean_env: Path) -> None:
 class TestInventories:
     def test_lists_inventories(self, runner, authed, mock_sdk) -> None:
         mock_sdk.inventory_manager.list_inventories.return_value = [
-            {"id": "p1", "name": "Prod edge", "item_count": 4, "linked_count": 2, "monitoring": True},
+            {"id": "p1", "name": "Prod edge", "tlp": "AMBER", "item_count": 4, "linked_count": 2, "monitoring": True},
         ]
         result = runner.invoke(app, ["inventory-manager", "list"])
         assert result.exit_code == ExitCode.OK
         assert "Prod edge" in result.output
+        assert "AMBER" in result.output  # the TLP column
         mock_sdk.inventory_manager.list_inventories.assert_awaited_once_with()
 
     def test_inventories_json(self, runner, authed, mock_sdk) -> None:
@@ -48,16 +49,47 @@ class TestInventories:
         mock_sdk.inventory_manager.get_inventory.return_value = {
             "inventory_name": "Prod",
             "description": "edge",
+            "tlp": "RED",
             "monitoring": True,
             "inventory": [{"product": "nginx"}],
             "attached": [],
             "scans": [],
+            "posture": {
+                "total_cves": 12,
+                "total_kev": 3,
+                "overdue_kev": 0,
+                "weaponized": 2,
+                "forensic_triage": 1,
+                "upgrades_ready": 0,
+                "max_weaponization": 91,
+            },
         }
         result = runner.invoke(app, ["inventory-manager", "show", "p1"])
         assert result.exit_code == ExitCode.OK
         assert "Prod" in result.output
+        # zero counts are dropped (except open CVEs); the exploit-evidence counts render
+        flat = " ".join(result.output.split())
+        assert "TLP RED" in flat
+        assert "12 open CVEs · 3 KEV · 2 with a Metasploit module · 1 need forensic review" in flat
+        assert "KEV overdue" not in flat and "upgrades ready" not in flat
         mock_sdk.inventory_manager.get_inventory.assert_awaited_once_with("p1")
         mock_sdk.inventory_manager.get_inventory_context.assert_not_awaited()
+
+    def test_inventory_manifest_shows_the_ot_profile(self, runner, authed, mock_sdk) -> None:
+        mock_sdk.inventory_manager.get_inventory.return_value = {
+            "inventory_name": "Plant",
+            "inventory": [
+                {"product": "s7", "asset_class": "plc", "safety_critical": True},
+                {"product": "hmi", "asset_class": "hmi"},
+                {"product": "web"},
+            ],
+            "attached": [],
+            "enrichments": [],
+        }
+        result = runner.invoke(app, ["inventory-manager", "show", "p1"])
+        assert result.exit_code == ExitCode.OK
+        flat = " ".join(result.output.split())
+        assert "OT profile: 2 classified assets (hmi, plc) · 1 safety-critical" in flat
 
     def test_inventory_context_emits_safe_preamble_unchanged(self, runner, authed, mock_sdk) -> None:
         preamble = (
@@ -122,13 +154,20 @@ class TestInventoryCompare:
                 {
                     "cve_id": "CVE-2021-44228",
                     "status": "persistent",
-                    "cells": [{"weaponization": 92, "kev": True}, {"weaponization": 95, "kev": True}],
+                    "cells": [
+                        {"weaponization": 92, "kev": True},
+                        {"weaponization": 95, "kev": True, "weaponized": True},
+                    ],
                 }
             ],
         }
         result = runner.invoke(app, ["inventory-manager", "compare", "e1", "e2"])
         assert result.exit_code == ExitCode.OK
         assert "1 new" in result.output and "CVE-2021-44228" in result.output
+        flat = " ".join(result.output.split())
+        assert (
+            "92 KEV" in flat and "95 KEV MSF" in flat and "92 KEV MSF" not in flat
+        )  # MSF only where the module exists
         mock_sdk.inventory_manager.compare_enrichments.assert_awaited_once_with(["e1", "e2"])
 
     def test_requires_two_to_twelve_ids(self, runner, authed, mock_sdk) -> None:
@@ -192,6 +231,18 @@ class TestInventoryCreate:
         result = runner.invoke(app, ["--json", "inventory-manager", "create", "--name", "X"])
         assert json.loads(result.output) == {"id": "p1", "item_count": 0}
 
+    def test_create_reports_the_marking_carried_to_linked_artifacts(self, runner, authed, mock_sdk) -> None:
+        mock_sdk.inventory_manager.create_inventory.return_value = {
+            "id": "p5",
+            "item_count": 0,
+            "attachment_tlp": "AMBER",
+            "attachment_tlp_ids": ["a1"],
+        }
+        result = runner.invoke(app, ["inventory-manager", "create", "--name", "Ctx", "--linked-artifact-id", "a1"])
+        assert result.exit_code == ExitCode.OK
+        assert "Created" in result.output
+        assert "Marked 1 artifact(s) TLP:AMBER to match the inventory." in result.output
+
     def test_missing_name_exits_64(self, runner, authed, mock_sdk) -> None:
         # --name is required → Click usage error, mapped to BAD_INPUT so it is
         # distinguishable from exit 2 ("no API key"). See exceptions.py.
@@ -242,6 +293,46 @@ class TestInventoryAttach:
         mock_sdk.inventory_manager.attach_to_inventory.return_value = {"ok": True, "linked": True, "already": False}
         result = runner.invoke(app, ["--json", "inventory-manager", "attach", "p1", "a1"])
         assert json.loads(result.output) == {"ok": True, "linked": True, "already": False}
+
+    def test_attach_reports_the_marking_carried_onto_the_artifact(self, runner, authed, mock_sdk) -> None:
+        # Attaching re-marks the artifact to the inventory's own TLP — the door says when it moved one.
+        mock_sdk.inventory_manager.attach_to_inventory.return_value = {
+            "ok": True,
+            "linked": True,
+            "already": False,
+            "attachment_tlp": "RED",
+            "attachment_tlp_ids": ["a1"],
+        }
+        result = runner.invoke(app, ["inventory-manager", "attach", "p1", "a1"])
+        assert result.exit_code == ExitCode.OK
+        assert "Marked 1 artifact(s) TLP:RED to match the inventory." in result.output
+
+    def test_bulk_attach_reports_every_carried_marking(self, runner, authed, mock_sdk) -> None:
+        mock_sdk.inventory_manager.add_attachments.return_value = {
+            "id": "p1",
+            "linked_count": 3,
+            "attached": 2,
+            "skipped": 0,
+            "mode": "append",
+            "attachment_tlp": "AMBER",
+            "attachment_tlp_ids": ["a1", "a2"],
+        }
+        result = runner.invoke(app, ["inventory-manager", "attach", "p1", "a1", "a2"])
+        assert result.exit_code == ExitCode.OK
+        assert "Marked 2 artifact(s) TLP:AMBER to match the inventory." in result.output
+
+    def test_no_marking_line_when_nothing_was_remarked(self, runner, authed, mock_sdk) -> None:
+        # Already at the inventory's marking → ids come back empty → no line (nothing moved).
+        mock_sdk.inventory_manager.attach_to_inventory.return_value = {
+            "ok": True,
+            "linked": True,
+            "already": False,
+            "attachment_tlp": "AMBER",
+            "attachment_tlp_ids": [],
+        }
+        result = runner.invoke(app, ["inventory-manager", "attach", "p1", "a1"])
+        assert result.exit_code == ExitCode.OK
+        assert "Marked" not in result.output
 
     def test_api_error_exits_3(self, runner, authed, mock_sdk) -> None:
         mock_sdk.inventory_manager.attach_to_inventory.side_effect = UnexpectedStatus(404, b"no such inventory")
@@ -312,7 +403,7 @@ class TestInventoryApplyFix:
         result = runner.invoke(app, ["inventory-manager", "apply-fix", "p1", "nginx", "1.27.4"])
         assert result.exit_code == ExitCode.OK
         assert "Applied" in result.output and "1.27.4" in result.output
-        mock_sdk.inventory_manager.apply_asset_fix.assert_awaited_once_with("p1", "nginx", "1.27.4", None)
+        mock_sdk.inventory_manager.apply_asset_fix.assert_awaited_once_with("p1", "nginx", "1.27.4", None, None)
 
     def test_passes_vendor(self, runner, authed, mock_sdk) -> None:
         mock_sdk.inventory_manager.apply_asset_fix.return_value = {
@@ -323,7 +414,29 @@ class TestInventoryApplyFix:
         }
         result = runner.invoke(app, ["inventory-manager", "apply-fix", "p1", "nginx", "1.27.4", "--vendor", "f5"])
         assert result.exit_code == ExitCode.OK
-        mock_sdk.inventory_manager.apply_asset_fix.assert_awaited_once_with("p1", "nginx", "1.27.4", "f5")
+        mock_sdk.inventory_manager.apply_asset_fix.assert_awaited_once_with("p1", "nginx", "1.27.4", "f5", None)
+
+    def test_passes_group_scope(self, runner, authed, mock_sdk) -> None:
+        # `--group` is the only way to patch ONE host from the CLI; without it the fix rewrites every
+        # asset carrying the product.
+        mock_sdk.inventory_manager.apply_asset_fix.return_value = {
+            "id": "p1",
+            "product": "nginx",
+            "version": "1.27.4",
+            "applied": 1,
+        }
+        result = runner.invoke(app, ["inventory-manager", "apply-fix", "p1", "nginx", "1.27.4", "--group", "web-01"])
+        assert result.exit_code == ExitCode.OK
+        mock_sdk.inventory_manager.apply_asset_fix.assert_awaited_once_with("p1", "nginx", "1.27.4", None, "web-01")
+
+    def test_passes_vendor_and_group_together(self, runner, authed, mock_sdk) -> None:
+        mock_sdk.inventory_manager.apply_asset_fix.return_value = {"id": "p1", "applied": 1}
+        result = runner.invoke(
+            app,
+            ["inventory-manager", "apply-fix", "p1", "nginx", "1.27.4", "--vendor", "f5", "--group", "web-01"],
+        )
+        assert result.exit_code == ExitCode.OK
+        mock_sdk.inventory_manager.apply_asset_fix.assert_awaited_once_with("p1", "nginx", "1.27.4", "f5", "web-01")
 
     def test_json(self, runner, authed, mock_sdk) -> None:
         mock_sdk.inventory_manager.apply_asset_fix.return_value = {"id": "p1", "product": "nginx", "version": "1.27.4"}
@@ -427,6 +540,34 @@ class TestInventoryEnrich:
             "p1", on_progress=ANY, save=False, enrich_attachments=None
         )
 
+    def test_lists_exploited_cves_once_and_top_log_sources(self, runner, authed, mock_sdk) -> None:
+        # Schema 2.2: a CVE on two assets is listed once; only KEV / Metasploit CVEs appear; log sources are
+        # ranked by how many catalog techniques each observes.
+        weaponized = {
+            "cve_id": "CVE-2000-0001",
+            "metasploit_modules": [{"rank_label": "Great"}],
+            "weaponization_score": 80,
+        }
+        mock_sdk.inventory_manager.enrich_inventory.return_value = {
+            "enrichment_id": "e" * 32,
+            "report": {
+                "summary": {"asset_count": 2, "total_cves": 3, "total_kev": 0},
+                "assets": [
+                    {"product": "a", "top_cves": [weaponized, {"cve_id": "CVE-2000-0009"}]},
+                    {"product": "b", "top_cves": [weaponized]},
+                ],
+                "technique_catalog": [
+                    {"technique_id": "T1", "log_sources": [{"name": "Process"}, {"name": "Web"}]},
+                    {"technique_id": "T2", "log_sources": [{"name": "Process"}]},
+                ],
+            },
+        }
+        result = runner.invoke(app, ["inventory-manager", "enrich", "p1"])
+        assert result.exit_code == ExitCode.OK
+        assert result.output.count("CVE-2000-0001") == 1 and "CVE-2000-0009" not in result.output
+        assert "Great" in result.output
+        assert "Log sources to collect: Process (2) · Web (1)" in result.output
+
     def test_empty_inventory(self, runner, authed, mock_sdk) -> None:
         mock_sdk.inventory_manager.enrich_inventory.return_value = {"enrichment_id": None, "empty": True}
         result = runner.invoke(app, ["inventory-manager", "enrich", "p1"])
@@ -466,6 +607,78 @@ class TestInventoryEnrich:
         result = runner.invoke(app, ["--json", "inventory-manager", "enrich", "p1"])
         assert json.loads(result.output) == payload
 
+    def test_unverified_assets_row_and_list(self, runner, authed, mock_sdk) -> None:
+        """#348 — the rollup card names the unverified count and lists each unverified asset with its
+        reason, so "0 CVEs" is never mistaken for "verified clean"."""
+        mock_sdk.inventory_manager.enrich_inventory.return_value = {
+            "enrichment_id": "e" * 32,
+            "report": {
+                "summary": {"asset_count": 3, "total_cves": 1, "total_kev": 0, "unmatched_assets": 2},
+                "assets": [
+                    {
+                        "product": "httpx",
+                        "status": "ok",
+                        "match": "cpe",
+                        "match_detail": "encode:httpx",
+                        "cve_count": 1,
+                    },
+                    {
+                        "product": "rich",
+                        "status": "ok",
+                        "match": "cpe_fuzzy",
+                        "match_detail": "no exact product among 57 CPEs",
+                        "cve_count": 0,
+                    },
+                    {
+                        "product": "typer",
+                        "status": "ok",
+                        "match": "none",
+                        "match_detail": "no CPE candidates",
+                        "cve_count": 0,
+                        "versions": ["0.25.1"],
+                    },
+                    {
+                        "product": "broken",
+                        "status": "error",
+                        "match": "none",
+                        "match_detail": "enrichment failed",
+                    },
+                ],
+            },
+        }
+        result = runner.invoke(app, ["inventory-manager", "enrich", "p1"])
+        assert result.exit_code == ExitCode.OK
+        assert "Unverified assets:" in result.output and "2" in result.output
+        assert "no CPE/OSV identity resolved" in result.output
+        # Compact product@version — detail lines for the unverified assets only.
+        assert "rich — no exact product among 57 CPEs" in result.output
+        assert "typer@0.25.1 — no CPE candidates" in result.output
+        # The resolved + error assets are NOT listed as unverified.
+        assert "encode:httpx" not in result.output
+        assert "broken" not in result.output
+
+    def test_no_unverified_assets_prints_no_row(self, runner, authed, mock_sdk) -> None:
+        """No unverified assets (rollup counter 0 / absent) → no extra card row; a pre-#348 artifact with
+        no per-asset match kinds reads as fully verified."""
+        mock_sdk.inventory_manager.enrich_inventory.return_value = {
+            "enrichment_id": "e" * 32,
+            "report": {
+                "summary": {"asset_count": 1, "total_cves": 0, "total_kev": 0},
+                "assets": [
+                    {
+                        "product": "nginx",
+                        "status": "ok",
+                        "match": "cpe",
+                        "match_detail": "nginx:nginx",
+                        "cve_count": 0,
+                    }
+                ],
+            },
+        }
+        result = runner.invoke(app, ["inventory-manager", "enrich", "p1"])
+        assert result.exit_code == ExitCode.OK
+        assert "Unverified" not in result.output
+
     def test_api_error_exits_3(self, runner, authed, mock_sdk) -> None:
         mock_sdk.inventory_manager.enrich_inventory.side_effect = UnexpectedStatus(503, b"engine unavailable")
         result = runner.invoke(app, ["inventory-manager", "enrich", "p1"])
@@ -493,6 +706,22 @@ class TestImportExport:
             inventory_id=None,
             mode="replace",
         )
+
+    def test_import_reports_dropped_sbom_dependency_edges(self, runner, authed, mock_sdk, tmp_path) -> None:
+        """#334 — an SBOM import whose dependency graph was cut (`dropped`) says so in human mode; the
+        overage is reported, never silently truncated (the 200-asset `truncated` hint's twin)."""
+        f = tmp_path / "bom.json"
+        f.write_text('{"bomFormat":"CycloneDX","components":[]}', encoding="utf-8")
+        mock_sdk.inventory_manager.import_inventory.return_value = {
+            "id": "p9",
+            "imported": 3,
+            "item_count": 3,
+            "format": "sbom",
+            "dropped": 4,
+        }
+        result = runner.invoke(app, ["inventory-manager", "import", str(f), "--format", "sbom"])
+        assert result.exit_code == ExitCode.OK
+        assert "4 SBOM dependency edges not retained" in result.output
 
     def test_import_passes_name_and_description(self, runner, authed, mock_sdk, tmp_path) -> None:
         f = tmp_path / "scan.xml"
@@ -524,7 +753,7 @@ class TestImportExport:
         result = runner.invoke(app, ["inventory-manager", "export", "p1", "--format", "csv"])
         assert result.exit_code == ExitCode.OK
         assert "Prod,nginx" in result.output
-        mock_sdk.inventory_manager.export_inventory.assert_awaited_once_with("p1", fmt="csv")
+        mock_sdk.inventory_manager.export_inventory.assert_awaited_once_with("p1", fmt="csv", tlp=None)
 
     def test_export_to_file(self, runner, authed, mock_sdk, tmp_path) -> None:
         out = tmp_path / "out.json"
@@ -532,7 +761,24 @@ class TestImportExport:
         result = runner.invoke(app, ["inventory-manager", "export", "p1", "--output", str(out)])
         assert result.exit_code == ExitCode.OK
         assert out.read_text(encoding="utf-8") == "{}"
-        mock_sdk.inventory_manager.export_inventory.assert_awaited_once_with("p1", fmt="json")
+        mock_sdk.inventory_manager.export_inventory.assert_awaited_once_with("p1", fmt="json", tlp=None)
+
+    def test_export_forwards_tlp_canonicalised(self, runner, authed, mock_sdk) -> None:
+        # #374: lowercase input normalises to the canonical SDK value, forwarded for a slot-carrying format.
+        mock_sdk.inventory_manager.export_inventory.return_value = "{}"
+        result = runner.invoke(
+            app, ["inventory-manager", "export", "p1", "--format", "cyclonedx", "--tlp", "amber+strict"]
+        )
+        assert result.exit_code == ExitCode.OK
+        mock_sdk.inventory_manager.export_inventory.assert_awaited_once_with("p1", fmt="cyclonedx", tlp="AMBER+STRICT")
+
+    def test_export_invalid_tlp_is_a_usage_error_before_the_api(self, runner, authed, mock_sdk) -> None:
+        result = runner.invoke(app, ["inventory-manager", "export", "p1", "--format", "cyclonedx", "--tlp", "purple"])
+        assert result.exit_code == ExitCode.BAD_INPUT
+        # The usage error lists the canonical UPPERCASE spellings, not casefolded ones.
+        # Flatten Rich's panel borders/line wrap before matching the list.
+        assert "'CLEAR', 'GREEN', 'AMBER', 'AMBER+STRICT', 'RED'" in " ".join(result.output.replace("│", " ").split())
+        mock_sdk.inventory_manager.export_inventory.assert_not_awaited()
 
     def test_export_rejects_unknown_format(self, runner, authed, mock_sdk) -> None:
         result = runner.invoke(app, ["inventory-manager", "export", "p1", "--format", "bogus"])
@@ -541,12 +787,16 @@ class TestImportExport:
 
     # Lock the CLI's format whitelists against drift from the real parser/exporter sets.
     @pytest.mark.parametrize(
-        "fmt", ["json", "sbom", "csv", "nmap", "list", "grype", "trivy", "depcheck", "nessus", "gvm", "xlsx"]
+        "fmt", ["json", "sbom", "csv", "nmap", "list", "grype", "trivy", "depcheck", "nessus", "gvm", "xlsx", "vex"]
     )
     def test_import_accepts_every_format(self, runner, authed, mock_sdk, tmp_path, fmt) -> None:
         f = tmp_path / "inv.dat"
         f.write_text("x", encoding="utf-8")
-        mock_sdk.inventory_manager.import_inventory.return_value = {"id": "p", "item_count": 1, "format": fmt}
+        payload = {"id": "p", "item_count": 1, "format": fmt}
+        if fmt == "vex":
+            # The VEX path renders its own overlay output (statements echo from the API).
+            payload = {**payload, "statements": 2}
+        mock_sdk.inventory_manager.import_inventory.return_value = payload
         result = runner.invoke(app, ["inventory-manager", "import", str(f), "--format", fmt])
         assert result.exit_code == ExitCode.OK
         assert mock_sdk.inventory_manager.import_inventory.await_args.kwargs["fmt"] == fmt
@@ -566,7 +816,7 @@ class TestImportExport:
         mock_sdk.inventory_manager.export_inventory.return_value = "{}"
         result = runner.invoke(app, ["inventory-manager", "export", "p1", "--format", fmt])
         assert result.exit_code == ExitCode.OK
-        mock_sdk.inventory_manager.export_inventory.assert_awaited_once_with("p1", fmt=fmt)
+        mock_sdk.inventory_manager.export_inventory.assert_awaited_once_with("p1", fmt=fmt, tlp=None)
 
     def test_export_workbook_writes_bytes(self, runner, authed, mock_sdk, tmp_path) -> None:
         # The binary export: the SDK returns BYTES; the CLI must write them to --output (refusing stdout).
@@ -576,7 +826,7 @@ class TestImportExport:
         result = runner.invoke(app, ["inventory-manager", "export", "p1", "--format", "workbook", "--output", str(out)])
         assert result.exit_code == ExitCode.OK
         assert out.read_bytes() == raw
-        mock_sdk.inventory_manager.export_inventory.assert_awaited_once_with("p1", fmt="workbook")
+        mock_sdk.inventory_manager.export_inventory.assert_awaited_once_with("p1", fmt="workbook", tlp=None)
 
     def test_export_workbook_without_output_is_rejected(self, runner, authed, mock_sdk) -> None:
         result = runner.invoke(app, ["inventory-manager", "export", "p1", "--format", "workbook"])
@@ -700,6 +950,7 @@ class TestGapC1AllSubcommands:
             (["show", "p1"], "get_inventory", {"inventory_name": "Prod", "inventory": []}),
             (["show", "p1", "--context"], "get_inventory_context", {"id": "p1", "context": "# Inventory"}),
             (["enrichments", "p1"], "list_enrichments", []),
+            (["history", "p1"], "get_history", {"items": [], "next_cursor": None}),
             (
                 ["compare", "a", "b"],
                 "compare_enrichments",
@@ -730,6 +981,7 @@ class TestGapC1AllSubcommands:
             "show p1",
             "show p1 --context",
             "enrichments p1",
+            "history p1",
             "compare a b",
             "create --name X",
             "delete p1",
@@ -817,3 +1069,119 @@ class TestRichMarkupEscaping:
         result = runner.invoke(app, ["inventory-manager", "import-multi", "-s", str(source)])
         assert result.exit_code == ExitCode.OK, result.output
         assert "[/]" in result.output
+
+
+class TestInventoryHistory:
+    def test_renders_items_and_deleted_ref(self, runner, authed, mock_sdk) -> None:
+        mock_sdk.inventory_manager.get_history.return_value = {
+            "items": [
+                {
+                    "id": "r1",
+                    "type": "report_generated",
+                    "at": "2026-10-01T10:00:00Z",
+                    "actor": "you",
+                    "surface": "web",
+                    "summary": "Report generated",
+                    "detail": None,
+                    "ref": {"kind": "report", "id": "x", "name": "Q3", "deleted": True},
+                },
+                {
+                    "id": "t1",
+                    "type": "tlp_changed",
+                    "at": "2026-10-02T10:00:00Z",
+                    "actor": "api",
+                    "surface": "api",
+                    "summary": "TLP RED",
+                    "detail": None,
+                    "ref": None,
+                },
+            ],
+            "next_cursor": None,
+        }
+        result = runner.invoke(app, ["inventory-manager", "history", "p1"])
+        assert result.exit_code == ExitCode.OK
+        assert "TLP RED" in result.output
+        assert "Q3 (deleted)" in result.output
+        mock_sdk.inventory_manager.get_history.assert_awaited_once_with(
+            "p1", types=None, q=None, since=None, until=None, actor=None, limit=None
+        )
+
+    def test_forwards_every_filter(self, runner, authed, mock_sdk) -> None:
+        mock_sdk.inventory_manager.get_history.return_value = {"items": [], "next_cursor": None}
+        result = runner.invoke(
+            app,
+            [
+                "inventory-manager",
+                "history",
+                "p1",
+                "--type",
+                "assets_changed",
+                "--type",
+                "renamed",
+                "--search",
+                "log4j",
+                "--since",
+                "2026-01-01",
+                "--until",
+                "2026-02-01",
+                "--actor",
+                "api",
+                "--limit",
+                "25",
+            ],
+        )
+        assert result.exit_code == ExitCode.OK
+        mock_sdk.inventory_manager.get_history.assert_awaited_once_with(
+            "p1",
+            types=["assets_changed", "renamed"],
+            q="log4j",
+            since="2026-01-01",
+            until="2026-02-01",
+            actor="api",
+            limit=25,
+        )
+
+    def test_all_follows_every_page(self, runner, authed, mock_sdk) -> None:
+        async def _pages(*_args, **_kwargs):
+            for item_id in ("a", "b"):
+                yield {
+                    "id": item_id,
+                    "type": "created",
+                    "at": "t",
+                    "actor": "you",
+                    "surface": "web",
+                    "summary": "Created",
+                    "detail": None,
+                    "ref": None,
+                }
+
+        mock_sdk.inventory_manager.iter_history = _pages
+        result = runner.invoke(app, ["inventory-manager", "history", "p1", "--all", "--json"])
+        assert result.exit_code == ExitCode.OK
+        assert [i["id"] for i in json.loads(result.output)["items"]] == ["a", "b"]
+        mock_sdk.inventory_manager.get_history.assert_not_awaited()
+
+    def test_hints_at_more_pages_without_all(self, runner, authed, mock_sdk) -> None:
+        mock_sdk.inventory_manager.get_history.return_value = {
+            "items": [
+                {
+                    "id": "a",
+                    "type": "created",
+                    "at": "t",
+                    "actor": "you",
+                    "surface": "web",
+                    "summary": "Created",
+                    "detail": None,
+                    "ref": None,
+                }
+            ],
+            "next_cursor": "c2",
+        }
+        result = runner.invoke(app, ["inventory-manager", "history", "p1"])
+        assert result.exit_code == ExitCode.OK
+        assert "--all" in result.output
+
+    def test_api_error_exits_3(self, runner, authed, mock_sdk) -> None:
+        mock_sdk.inventory_manager.get_history.side_effect = UnexpectedStatus(400, b'{"error":"bad"}')
+        result = runner.invoke(app, ["inventory-manager", "history", "p1"])
+        assert result.exit_code == ExitCode.API_ERROR

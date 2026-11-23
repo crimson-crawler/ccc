@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from unittest.mock import patch
 
 from rich.console import Console
@@ -34,8 +35,8 @@ def test_render_cve_includes_score_and_techniques() -> None:
     payload = {
         "cve": {
             "cve_id": "CVE-2024-3400",
-            "cvss_score": 9.8,
-            "cvss_severity": "CRITICAL",
+            "cvss_v3_score": 9.8,
+            "cvss_v3_severity": "CRITICAL",
             "description": "PAN-OS bypass",
             "has_public_exploit": True,
             "poc_count": 3,
@@ -70,7 +71,7 @@ def test_render_cve_poc_count_from_top_level_list() -> None:
     must count the list.
     """
     payload = {
-        "cve": {"cve_id": "CVE-2025-24813", "cvss_score": 9.8, "cvss_severity": "CRITICAL", "poc_count": 0},
+        "cve": {"cve_id": "CVE-2025-24813", "cvss_v3_score": 9.8, "cvss_v3_severity": "CRITICAL", "poc_count": 0},
         "poc": [{"html_url": "https://github.com/a/b"}, {"html_url": "https://github.com/c/d"}],
     }
     text = _capture(_formatters.render_cve, payload)
@@ -80,7 +81,7 @@ def test_render_cve_poc_count_from_top_level_list() -> None:
 
 def test_render_cve_poc_count_falls_back_to_scalar() -> None:
     """With no top-level ``poc`` list, fall back to ``cve.poc_count``."""
-    payload = {"cve": {"cve_id": "CVE-X", "cvss_score": 7.0, "cvss_severity": "HIGH", "poc_count": 5}}
+    payload = {"cve": {"cve_id": "CVE-X", "cvss_v3_score": 7.0, "cvss_v3_severity": "HIGH", "poc_count": 5}}
     text = _capture(_formatters.render_cve, payload)
     poc_row = next(line for line in text.splitlines() if "PoC count" in line)
     assert "5" in poc_row
@@ -89,11 +90,170 @@ def test_render_cve_poc_count_falls_back_to_scalar() -> None:
 def test_render_cve_handles_legacy_score_epss_key() -> None:
     """Fall back to ``epss.score`` when ``epss.epss`` isn't present (older SDKs)."""
     payload = {
-        "cve": {"cve_id": "CVE-X", "cvss_score": 7.0, "cvss_severity": "HIGH"},
+        "cve": {"cve_id": "CVE-X", "cvss_v3_score": 7.0, "cvss_v3_severity": "HIGH"},
         "epss": {"score": 0.5, "percentile": 0.8},
     }
     text = _capture(_formatters.render_cve, payload)
     assert "0.5" in text
+
+
+def test_render_cve_marks_retracted_osv_advisory_and_withholds_its_fix() -> None:
+    """A retracted advisory keeps its row and its id, but must not read as a live finding.
+
+    ``enrich/cve``'s ``osv_advisories`` come off the ``/vulns/{id}`` GET lane, which does return
+    records the source withdrew — the same payload an imported/saved enrichment report can carry.
+    So the row stays (provenance) and its ``fixed_versions`` do not surface as a recommendation.
+    """
+    payload = {
+        "cve": {"cve_id": "CVE-2024-3400"},
+        "osv_advisories": [
+            {"id": "GHSA-live-1111", "severity_label": "HIGH", "fixed_versions": ["1.2.3"], "summary": "live"},
+            {
+                "id": "GHSA-gone-2222",
+                "severity_label": "CRITICAL",
+                "fixed_versions": ["9.9.9"],
+                "summary": "retracted",
+                "withdrawn": "2026-03-01T00:00:00Z",
+            },
+        ],
+    }
+    text = _capture(_formatters.render_cve, payload)
+
+    # The count a reader acts on excludes the retraction; the retraction is named instead.
+    assert "OSV advisories (1 active, 1 retracted)" in text
+
+    live = next(line for line in text.splitlines() if "GHSA-live-1111" in line)
+    assert "active" in live
+    assert "1.2.3" in live
+
+    gone = next(line for line in text.splitlines() if "GHSA-gone-2222" in line)
+    assert "withdrawn 2026-03-01T00:00:00Z" in gone
+    assert "9.9.9" not in gone
+    assert "9.9.9" not in text  # no actionable fix from a retracted advisory, anywhere
+
+
+def test_render_cve_keeps_advisories_without_the_flag_unchanged() -> None:
+    """No ``withdrawn`` key — the shape before the field existed — renders exactly as before."""
+    payload = {
+        "cve": {"cve_id": "CVE-2024-3400"},
+        "osv_advisories": [{"id": "GHSA-live-1111", "fixed_versions": ["1.2.3"]}],
+    }
+    text = _capture(_formatters.render_cve, payload)
+
+    assert "OSV advisories (1)" in text
+    assert "withdrawn" not in text
+    assert "retracted" not in text
+
+
+def test_render_cve_escapes_markup_in_osv_advisory_fields() -> None:
+    """``id`` / ``withdrawn`` / ``summary`` are upstream text and must not be interpreted as markup.
+
+    Each cell appears literally — including a link tag long enough to hit the status-cell trim, which
+    must still render as data rather than becoming a link.
+    """
+    payload = {
+        "cve": {"cve_id": "CVE-2024-3400"},
+        "osv_advisories": [
+            {
+                "id": "[red]GHSA-owned[/red]",
+                "withdrawn": "[link=https://evil.example]2026-03-01[/link]",
+                "summary": "[bold]x[/bold]",
+            }
+        ],
+    }
+    text = _capture(_formatters.render_cve, payload)
+
+    assert "[red]GHSA-owned[/red]" in text
+    assert "[bold]x[/bold]" in text
+    assert "[link=https://evil." in text
+
+
+def test_render_package_preserves_an_explicit_zero_advisory_count() -> None:
+    """``vulnerability_count: 0`` is an answer, not an absent value.
+
+    ``or len(advisories)`` recomputed the count from the list whenever the payload said 0 — exactly
+    the case a retracted-advisory reduction produces, so the withdrawn finding came back as a
+    headline number.
+    """
+    payload = {
+        "ecosystem": "PyPI",
+        "package": "django",
+        "version": "1.0.0",
+        "vulnerability_count": 0,
+        "advisories": [{"id": "GHSA-gone-1111", "withdrawn": "2026-03-01T00:00:00Z", "fixed_versions": ["9.9.9"]}],
+        "cves": [],
+    }
+    text = _capture(_formatters.render_package, payload)
+
+    count_row = next(line for line in text.splitlines() if "Advisories" in line and "Active" not in line)
+    assert "0" in count_row.split()
+    assert "1" not in count_row.split()  # not the list length a `or len(advisories)` fallback produced
+    assert "GHSA-gone-1111" in text  # the record itself is not discarded
+    assert "9.9.9" not in text  # …but its fix is not presented
+    assert "Active advisories" in text
+
+
+def test_render_package_marks_retracted_rows_and_counts_only_active() -> None:
+    """A mixed payload lists both rows, labels the retracted one, and counts only the live one."""
+    payload = {
+        "ecosystem": "npm",
+        "package": "lodash",
+        "version": "1.0.0",
+        "vulnerability_count": 2,
+        "advisories": [
+            {"id": "GHSA-live-1111", "cve_ids": ["CVE-2024-1111"], "fixed_versions": ["2.0.0"], "summary": "live"},
+            {
+                "id": "GHSA-gone-2222",
+                "fixed_versions": ["9.9.9"],
+                "summary": "retracted",
+                "withdrawn": "2026-03-01T00:00:00Z",
+            },
+        ],
+    }
+    text = _capture(_formatters.render_package, payload)
+
+    assert "OSV advisories (1 active, 1 retracted)" in text
+    assert "(excludes 1 retracted)" in text
+
+    live = next(line for line in text.splitlines() if "GHSA-live-1111" in line)
+    assert "active" in live
+    assert "2.0.0" in live
+
+    gone = next(line for line in text.splitlines() if "GHSA-gone-2222" in line)
+    assert "withdrawn 2026-03-01T00:00:00Z" in gone
+    assert "9.9.9" not in text
+
+    # `--json` prints this same dict, so the renderer must not have consumed anything from it.
+    assert payload["advisories"][1]["fixed_versions"] == ["9.9.9"]
+
+
+def test_render_package_marks_withdrawn_nd_envelope() -> None:
+    payload = {
+        "ecosystem": "PyPI",
+        "package": "example",
+        "vulnerability_count": 0,
+        "advisories": [
+            {
+                "id": "CGA-dead",
+                "withdrawn": True,
+                "withdrawn_at": "2024-03-01T03:04:05Z",
+                "source_url": "https://osv.dev/vulnerability/CGA-dead",
+            }
+        ],
+    }
+    text = _capture(_formatters.render_package, payload)
+    assert "CGA-dead" in text and "withdrawn 2024-03-01T03:04:05Z" in text
+    assert "1 retracted" in text and "True" not in text
+
+
+def test_render_package_escapes_nd_withdrawal_timestamp() -> None:
+    payload = {
+        "ecosystem": "PyPI",
+        "package": "example",
+        "advisories": [{"id": "CGA-dead", "withdrawn": True, "withdrawn_at": "[red]2024-03-01[/red]"}],
+    }
+    text = _capture(_formatters.render_package, payload)
+    assert "[red]2024-03-01[/re" in text
 
 
 def test_format_kev_unlisted_returns_no() -> None:
@@ -111,6 +271,48 @@ def test_format_kev_listed_surfaces_due_date_and_ransomware() -> None:
         _formatters._format_kev({"in_kev": True, "due_date": "2024-05-01", "ransomware": True})
         == "yes — due 2024-05-01, ransomware"
     )
+
+
+def test_render_search_kev_states_membership_for_an_unlisted_cve() -> None:
+    """A KEV miss is a real row with null catalogue fields, so the table must state membership.
+
+    ``ccc search kev CVE-1999-99999`` answers with one row — ``in_kev: false`` and every
+    catalogue field null — and rendering that row with no membership cell leaves a decisive
+    "not on the catalog" looking like an entry whose metadata failed to load. Cells are read
+    back through the header, so reordering or adding columns doesn't touch this.
+    """
+    miss = {
+        "cve_id": "CVE-1999-99999",
+        "in_kev": False,
+        "vendor_project": None,
+        "product": None,
+        "date_added": None,
+        "due_date": None,
+        "ransomware": False,
+        "vulnerability_name": None,
+    }
+    hit = {
+        "cve_id": "CVE-2024-3400",
+        "in_kev": True,
+        "vendor_project": "Palo Alto Networks",
+        "product": "PAN-OS",
+        "date_added": "2024-04-12",
+        "due_date": "2024-04-19",
+        "ransomware": True,
+        "vulnerability_name": "PAN-OS Command Injection",
+    }
+    text = _capture(_formatters.render_search_kev, {"results": [miss, hit]}, width=240)
+    header = next(line for line in text.splitlines() if "In KEV" in line)
+    names = [cell.strip() for cell in re.split(r"[│┃]", header)[1:-1]]
+
+    def membership(row: dict) -> str:
+        line = next(line for line in text.splitlines() if row["cve_id"] in line)
+        return [cell.strip() for cell in re.split(r"[│┃]", line)[1:-1]][names.index("In KEV")]
+
+    assert membership(miss) == "no"
+    assert membership(hit) == "yes"
+    # A row that states nothing is unknown, not a false membership claim.
+    assert _formatters._kev_membership({"cve_id": "CVE-2024-3400"}) == "—"
 
 
 def test_format_epss_score_with_velocity_inline() -> None:
@@ -178,6 +380,52 @@ def test_render_cve_handles_missing_fields() -> None:
     assert "Crimson Crawler" not in text
 
 
+def test_render_cve_keeps_source_only_advisories_and_attribution() -> None:
+    for advisory_id, licence in (("GHSA-1", "CC-BY-4.0"), ("CGA-1", "CC-BY-NC-ND-4.0")):
+        payload = {
+            "cve": None,
+            "osv_advisories": [
+                {
+                    "id": advisory_id,
+                    "summary": "Distinctive advisory",
+                    "source_url": "https://osv.dev/vulnerability/" + advisory_id,
+                    "licence": licence,
+                    "licence_url": "https://example.test/licence",
+                    "attribution": "Publisher [bold]literal[/bold]; fields selected",
+                }
+            ],
+            "errors": [{"service": "osv", "error": "stale_copy", "detail": "OSV data as of yesterday"}],
+        }
+        text = _capture(_formatters.render_cve, payload)
+        assert "No data found" not in text
+        assert advisory_id in text and "Distinctive advisory" in text
+        assert "https://osv.dev/vulnerability/" + advisory_id in text
+        assert licence in text and "https://example.test/licence" in text
+        assert "Publisher [bold]literal[/bold]" in text
+        assert "stale_copy" in text and "OSV data as of yesterday" in text
+
+
+def test_render_cve_keeps_source_only_android_credit() -> None:
+    text = _capture(
+        _formatters.render_cve,
+        {
+            "cve": None,
+            "android_bulletin": {
+                "asb_id": "ASB-A-111893654",
+                "severity": "High",
+                "source_url": "https://example.test/android",
+                "licence": "CC-BY-4.0",
+                "attribution": "Android Open Source Project; CC-BY-4.0 https://creativecommons.org/licenses/by/4.0/",
+            },
+        },
+    )
+    assert "No data found" not in text
+    assert "ASB-A-111893654" in text
+    assert "https://example.test/android" in text
+    assert "Android Open Source Project" in text
+    assert "https://creativecommons.org/licenses/by/4.0/" in text
+
+
 def test_render_cve_not_found_echoes_requested_id() -> None:
     """The ``requested_id`` value is echoed verbatim into the not-found message.
 
@@ -207,12 +455,12 @@ def test_render_product_lists_top_cves() -> None:
         "cpe_matches": [{"cpe": "cpe:2.3:a:nginx"}],
         "cves": [
             {
-                "cve": {"cve_id": "CVE-2023-44487", "cvss_score": 7.5, "description": "rapid reset"},
+                "cve": {"cve_id": "CVE-2023-44487", "cvss_v3_score": 7.5, "description": "rapid reset"},
                 "epss": {"epss": 0.42},  # canonical key
                 "kev": {"in_kev": True, "vendor_inventory": "nginx"},
             },
             {
-                "cve": {"cve_id": "CVE-2024-00001", "cvss_score": 5.0, "description": "legacy shape"},
+                "cve": {"cve_id": "CVE-2024-00001", "cvss_v3_score": 5.0, "description": "legacy shape"},
                 "epss": {"score": 0.07},  # legacy SDK key still works
                 "kev": {"in_kev": False, "vendor_inventory": "nginx"},  # truthy-dict trap
             },
@@ -463,6 +711,36 @@ def test_render_technique_handles_empty_response() -> None:
     assert "Crimson Crawler" not in text
 
 
+def test_render_technique_surfaces_ics_asset_and_fraud_techniques() -> None:
+    """The ICS-asset lookup's own `asset` and the opt-in `f3_techniques` layer are rendered rather than
+    silently dropped by the table."""
+    payload = {
+        "techniques": [
+            {
+                "technique_id": "T0852",
+                "name": "Screen Capture",
+                "tactics": ["collection"],
+                "platforms": ["None"],
+                "description": "capture",
+                "f3_techniques": [
+                    {
+                        "object_id": "F1031",
+                        "name": "Impersonate Account Holder",
+                        "url": "https://ctid.mitre.org/fraud/F1031",
+                    }
+                ],
+            }
+        ],
+        "asset": {"asset_id": "A0002", "name": "Human-Machine Interface (HMI)"},
+        "errors": [],
+    }
+    text = _capture(_formatters.render_technique, payload)
+
+    assert "A0002" in text and "Human-Machine Interface (HMI)" in text
+    assert "F3 fraud techniques (1)" in text
+    assert "F1031" in text
+
+
 def test_render_technique_not_found_echoes_requested_id() -> None:
     """``requested_id`` is echoed verbatim into the empty-techniques message.
 
@@ -539,6 +817,60 @@ def test_render_ioc_emits_verdict_and_techniques() -> None:
     assert "Errors" in text
 
 
+def test_render_ioc_publishes_network_registration_and_list_rows() -> None:
+    """#466 IOC network tokens: ASN, RDAP registration and the unified list ledger each get a row."""
+    payload = {
+        "value": "1.10.16.5",
+        "type": "ip-dst",
+        "network_context": {
+            "ip": "1.10.16.5",
+            "version": 4,
+            "asn": None,
+            "as_name": None,
+            "country": None,
+            "prefix": "1.10.0.0/17",
+            "source": "iptoasn",
+        },
+        "domain_context": {
+            "domain": "example.com",
+            "registration_date": "1995-08-14T04:00:00Z",
+            "age_days": 10000,
+            "registrar": "RESERVED-Internet Assigned Numbers Authority",
+            "status": [],
+            "source": "rdap",
+        },
+        "listed_on": [
+            {"source": "example.org", "list": "Example list A", "match": "exact"},
+            {"source": "Spamhaus DROP", "list": "DROP", "match": "cidr"},
+        ],
+    }
+    text = _capture(_formatters.render_ioc, payload)
+    assert "not routed / unknown" in text
+    assert "1.10.0.0/17" in text
+    assert "1995-08-14T04:00:00Z (10000 days)" in text
+    assert "example.org/Example list A (exact)" in text
+    assert "Spamhaus DROP/DROP (cidr)" in text
+
+
+def test_render_ioc_network_only_answer_is_not_reported_as_no_data() -> None:
+    payload = {
+        "value": "8.8.8.8",
+        "type": "ip-dst",
+        "network_context": {
+            "ip": "8.8.8.8",
+            "version": 4,
+            "asn": 15169,
+            "as_name": "GOOGLE",
+            "country": "US",
+            "prefix": "8.8.8.0/24",
+            "source": "iptoasn",
+        },
+    }
+    text = _capture(_formatters.render_ioc, payload)
+    assert "AS15169 GOOGLE; US; 8.8.8.0/24" in text
+    assert "No data" not in text and "no data" not in text.lower()
+
+
 def test_render_ioc_handles_empty_response() -> None:
     """No MISP attributes / feed hits / techniques → not-found line, no table."""
     text = _capture(_formatters.render_ioc, {"value": "9.9.9.9", "type_": "ip-dst"})
@@ -554,14 +886,17 @@ def test_render_ioc_warninglist_false_renders_no() -> None:
 
 
 def test_render_cwe_emits_detail_and_techniques() -> None:
-    """Populated CWE renders name + abstraction + CAPEC/technique counts."""
+    """Populated CWE renders the identity rows plus the hierarchy/categories/detection layers."""
     payload = {
         "weakness": {
             "cwe_id": "CWE-79",
             "name": "Cross-site Scripting",
             "description": "Improper neutralization of input.",
-            "abstraction": "Base",
-            "status": "Stable",
+            "likelihood_of_exploit": "High",
+            "related_weaknesses": [{"nature": "ChildOf", "cwe_id": "CWE-74"}],
+            "categories": [{"grouping_id": "CWE-1396", "name": "Access Control"}],
+            "views": [{"grouping_id": "CWE-699", "name": "Software Development View"}],
+            "detection_methods": ["Automated Static Analysis"],
         },
         "attack_patterns": [{"capec_id": "CAPEC-63"}, {"capec_id": "CAPEC-588"}],
         "techniques": [{"technique_id": "T1059", "name": "Command", "tactics": ["execution"]}],
@@ -572,9 +907,37 @@ def test_render_cwe_emits_detail_and_techniques() -> None:
     text = _capture(_formatters.render_cwe, payload)
     assert "CWE-79" in text
     assert "Cross-site Scripting" in text
-    assert "Base" in text
     assert "high_frequency" in text
     assert "T1059" in text
+    # The layers that are the reason to request a CWE bundle: the actual parent edge, the MITRE
+    # groupings and the detection guidance — not counts alone.
+    assert "CWE-74" in text
+    assert "CWE-1396" in text
+    assert "Automated Static Analysis" in text
+    assert "High" in text
+
+
+def test_render_cwe_marks_a_generic_weakness() -> None:
+    """``is_generic`` replaced the removed ``version`` row; a specific CWE prints neither."""
+    weakness = {"cwe_id": "CWE-284", "name": "Improper Access Control", "is_generic": True}
+    generic = _capture(_formatters.render_cwe, {"weakness": weakness})
+    assert "Generic weakness" in generic
+    assert "pillar/class" in generic
+
+    specific = _capture(_formatters.render_cwe, {"weakness": {"cwe_id": "CWE-79", "name": "XSS"}})
+    assert "Generic weakness" not in specific
+    assert "Version" not in specific  # the row the removed CWEDetail.version fed
+
+
+def test_render_cwe_search_matches_are_rendered() -> None:
+    """``weakness: null`` WITH search results is a ``--search`` hit, not a miss."""
+    payload = {
+        "weakness": None,
+        "search_results": [{"cwe_id": "CWE-79", "name": "Cross-site Scripting", "description": "x"}],
+    }
+    text = _capture(_formatters.render_cwe, payload)
+    assert "CWE-79" in text
+    assert "No data found" not in text
 
 
 def test_render_cwe_handles_missing_weakness() -> None:
@@ -668,6 +1031,181 @@ def test_with_live_progress_no_ui_in_json_mode() -> None:
     assert seen  # callback supplied (a no-op), coroutine ran
 
 
+# -- render_entity (the eleven id-or-search entity payloads) -------------------- #
+
+# Trimmed real responses. F3/CLOAK's ``FrameworkObjectDetail`` names the framework id
+# ``object_id`` (the ATLAS/DISARM ``TechniqueDetail`` uses ``technique_id``), F3 hangs its
+# ATT&CK hop off ``linked_techniques``, and a CLOAK tool carries no tactics and no url — so
+# the row set has to shrink to fit rather than print empty cells.
+_F3_PAYLOAD = {
+    "technique": {
+        "object_id": "F1031",
+        "name": "Impersonate Account Holder",
+        "description": "Fraud actors may impersonate legitimate account holders.",
+        "object_type": "attack-pattern",
+        "tactics": ["initial-access", "defense-evasion"],
+        "url": "https://ctid.mitre.org/fraud/techniques/F1031",
+        "stix_id": "attack-pattern--03361ddb-cd4a-552e-b1ad-aa6b1a07d343",
+    },
+    "linked_techniques": [
+        {"technique_id": "T1593", "name": "Search Open Websites/Domains", "tactics": ["reconnaissance"]}
+    ],
+    "knowledgebase": [{"title": "kb"}],
+    "errors": [],
+}
+
+_CLOAK_PAYLOAD = {
+    "technique": {
+        "object_id": "TTP-496",
+        "name": "DNS over TLS (DoT)",
+        "description": "Encrypts DNS queries over a dedicated TLS connection.",
+        "object_type": "tool",
+        "tactics": [],
+        "url": "",
+        "stix_id": "tool--21f35349-52db-56ac-9d9e-3b9558fec6f6",
+    },
+    "knowledgebase": [{"title": "kb"}],
+    "errors": [],
+}
+
+
+def test_render_entity_renders_framework_object_detail() -> None:
+    """F3's detail model names the id ``object_id`` — the ID and Tactics rows must still fill."""
+    text = _capture(_formatters.render_entity, _F3_PAYLOAD)
+
+    assert "F1031" in text  # read from object_id, not technique_id
+    assert "initial-access, defense-evasion" in text  # tactics row
+    assert "attack-pattern" in text  # object_type row
+    assert "linked techniques 1 · knowledgebase 1" in text
+    assert "T1593" in text  # the linked-techniques sub-table
+    assert "https://ctid.mitre.org/fraud/techniques/F1031" in text
+
+
+def test_render_entity_omits_absent_cloak_rows() -> None:
+    """A CLOAK tool has no tactics, no url and no technique hop — those rows must not print."""
+    text = _capture(_formatters.render_entity, _CLOAK_PAYLOAD)
+
+    assert "TTP-496" in text
+    assert "tool" in text
+    assert "knowledgebase 1" in text
+    assert "Tactics" not in text
+    assert "Reference" not in text
+    assert "Linked techniques" not in text
+    assert "│ —" not in text  # no cell renders the placeholder
+
+
+def test_render_entity_search_matches_read_object_id() -> None:
+    """``search_results`` rows are the same detail model, so the match table needs object_id."""
+    text = _capture(
+        _formatters.render_entity,
+        {"search_results": [{"object_id": "TTP-2799", "name": "DNSCrypt", "description": "x"}], "errors": []},
+    )
+
+    assert "TTP-2799" in text
+    assert "DNSCrypt" in text
+
+
+def test_render_entity_search_match_table_only_shows_aliases_a_model_declares() -> None:
+    """Six of the eleven entity details still declare ``aliases``; five dropped it.
+
+    The match table is shared by all eleven entity commands, so an unconditional Aliases
+    column printed a blank cell for every ATT&CK/ATLAS/DISARM technique and F3/CLOAK object
+    match — a column that could never be filled.
+    """
+    technique_match = _capture(
+        _formatters.render_entity,
+        {
+            "search_results": [
+                {"technique_id": "T1190", "name": "Exploit Public-Facing Application", "description": "x"}
+            ],
+            "errors": [],
+        },
+    )
+    assert "Aliases" not in technique_match  # TechniqueDetail has no aliases field
+
+    group_match = _capture(
+        _formatters.render_entity,
+        {
+            "search_results": [{"group_id": "G0016", "name": "APT29", "aliases": ["Cozy Bear"], "description": "x"}],
+            "errors": [],
+        },
+    )
+    assert "Aliases" in group_match
+    assert "Cozy Bear" in group_match
+
+
+def test_render_entity_renders_the_objects_revision_history() -> None:
+    """``include=['versions']`` history hangs off the entity — every entity, not just technique/CWE."""
+    payload = {
+        **_F3_PAYLOAD,
+        "technique": {
+            **_F3_PAYLOAD["technique"],
+            "revision_history": [
+                {"modified": "2026-04-08T17:36:46.311Z", "versions": ["1.0"], "latest": True},
+            ],
+        },
+    }
+
+    text = _capture(_formatters.render_entity, payload)
+
+    assert "Revision history (1)" in text
+    assert "2026-04-08T17:36:46.311Z" in text
+    assert "1.0" in text
+
+
+def test_render_entity_without_history_prints_no_history_table() -> None:
+    """The opt-out case stays silent — no empty table, no placeholder."""
+    text = _capture(_formatters.render_entity, _F3_PAYLOAD)
+
+    assert "Revision history" not in text
+
+
+def test_render_entity_revision_history_distinguishes_unknown_from_not_current() -> None:
+    """``latest`` is tri-state: a row the source never judged must not render the "no" of a False.
+
+    The KB histories (every ATT&CK-family surface) carry no current-status, so the column reads
+    "—"; the CVE path's explicit False still reads "no".
+    """
+    payload = {
+        **_F3_PAYLOAD,
+        "technique": {
+            **_F3_PAYLOAD["technique"],
+            "revision_history": [
+                {"modified": "2026-09-01T00:00:00Z", "versions": ["9.9.9"], "latest": True},
+                {"modified": "2026-05-01T00:00:00Z", "versions": ["9.9.8"], "latest": False},
+                {"modified": "2026-01-01T00:00:00Z", "versions": ["9.9.7"]},
+            ],
+        },
+    }
+
+    lines = _capture(_formatters.render_entity, payload).splitlines()
+
+    def current_cell(version: str) -> str:
+        line = next(line for line in lines if version in line)
+        return [cell.strip() for cell in line.split("│") if cell.strip()][-1]
+
+    assert current_cell("9.9.9") == "yes"
+    assert current_cell("9.9.8") == "no"
+    assert current_cell("9.9.7") == "—"
+
+
+def test_render_cwe_reads_the_history_off_the_weakness() -> None:
+    """The API attaches it to ``weakness`` (``CWEDetail``); a payload-level read showed nothing."""
+    payload = {
+        "weakness": {
+            "cwe_id": "CWE-284",
+            "name": "Improper Access Control",
+            "revision_history": [{"modified": "2026-05-01T00:00:00Z", "versions": ["4.19"], "latest": True}],
+        },
+        "errors": [],
+    }
+
+    text = _capture(_formatters.render_cwe, payload)
+
+    assert "Revision history (1)" in text
+    assert "4.19" in text
+
+
 # -- --expand mode ------------------------------------------------------------- #
 
 _LONG_DESCRIPTION = "X" * 250  # > the 200-char CVE/CWE description cap
@@ -724,7 +1262,7 @@ def test_expand_lifts_linked_techniques_row_cap() -> None:
 
 def test_expand_lifts_product_top_cves_row_cap() -> None:
     """>10 product Top-CVEs: default caps at 10, --expand renders every row."""
-    cves = [{"cve": {"cve_id": f"CVE-2024-{i:05d}", "cvss_score": 5.0, "description": "x"}} for i in range(13)]
+    cves = [{"cve": {"cve_id": f"CVE-2024-{i:05d}", "cvss_v3_score": 5.0, "description": "x"}} for i in range(13)]
     payload = {
         "product": "nginx",
         "vendor": "nginx",

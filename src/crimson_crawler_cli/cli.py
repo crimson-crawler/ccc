@@ -2,9 +2,9 @@
 
 Registers global flags (``--json``, ``--expand``, ``--version``) and the shipped
 commands. Every ``/v1`` operation is reachable: the ``enrich``, ``search``, and
-``assess`` groups cover the 29 synchronous endpoints, and the two async engines
-(``artifact-enrich``, ``inventory-enrich``) are groups whose callback submits and
-whose ``status ID`` subcommand reads the job back. ``search-techniques`` remains
+``assess`` groups cover the 31 synchronous endpoints, and the three async engines
+(``artifact-enrich``, ``inventory-enrich``, ``event-enrich``) are groups whose callback
+submits and whose ``status ID`` subcommand reads the job back. ``search-techniques`` remains
 as a deprecated top-level alias for ``ccc search techniques``.
 
 Every data command also declares :data:`output.JsonFlag` and
@@ -28,6 +28,7 @@ from .commands import assess as assess_cmd
 from .commands import crawl as crawl_cmd
 from .commands import enrich as enrich_cmd
 from .commands import enrich_artifact as enrich_artifact_cmd
+from .commands import enrich_event as enrich_event_cmd
 from .commands import enrich_inventory as enrich_inventory_cmd
 from .commands import ingest as ingest_cmd
 from .commands import inventory_manager as inventory_manager_cmd
@@ -36,6 +37,7 @@ from .commands import search as search_cmd
 from .commands import search_techniques as search_techniques_cmd
 from .commands import whoami as whoami_cmd
 from .exceptions import ExitCode, handle_errors
+from .tlp import tlp_option, tlp_value
 
 app = typer.Typer(
     name="ccc",
@@ -44,7 +46,7 @@ app = typer.Typer(
     add_completion=False,
 )
 
-# The two async engines are command groups rather than leaf commands: the group
+# The three async engines are command groups rather than leaf commands: the group
 # callback IS the submit (so `ccc artifact-enrich --text …` keeps working exactly
 # as it shipped) and `status ID` reads the job back. `invoke_without_command`
 # plus `no_args_is_help=False` is what makes a bare group invocation run the
@@ -61,12 +63,19 @@ inventory_enrich_app = typer.Typer(
     invoke_without_command=True,
     no_args_is_help=False,
 )
+event_enrich_app = typer.Typer(
+    name="event-enrich",
+    help="Submit a raw security event to the async Event Enricher engine → graded event verdict.",
+    invoke_without_command=True,
+    no_args_is_help=False,
+)
 
 app.add_typer(enrich_cmd.app, name="enrich")
 app.add_typer(search_cmd.app, name="search")
 app.add_typer(assess_cmd.app, name="assess")
 app.add_typer(artifact_enrich_app, name="artifact-enrich")
 app.add_typer(inventory_enrich_app, name="inventory-enrich")
+app.add_typer(event_enrich_app, name="event-enrich")
 app.add_typer(artifact_manager_cmd.app, name="artifact-manager")
 app.add_typer(inventory_manager_cmd.app, name="inventory-manager")
 app.add_typer(reports_cmd.app, name="reports")
@@ -133,7 +142,19 @@ def artifact_enrich(
             dir_okay=False,
             readable=True,
             show_default=False,
-            help="Artifact file to upload (repeatable). Read as bytes, base64-encoded.",
+            help=(
+                "Artifact file to upload (repeatable): PDF, Word, PowerPoint, Excel/CSV, EML, HTML, scan XML, "
+                "JSON, or any text. Images and scanned PDFs are not read."
+            ),
+        ),
+    ] = None,
+    attached_artifact_ids: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--attach-id",
+            help="Id of a stored artifact whose content is in --text (repeatable) — the report records it as "
+            "a source; attribution is never guessed from the text.",
+            show_default=False,
         ),
     ] = None,
     depth: Annotated[
@@ -152,13 +173,28 @@ def artifact_enrich(
         bool,
         typer.Option("--save", help="Save the finished report into your Artifact Manager library (usage-exempt)."),
     ] = False,
+    tlp: Annotated[
+        str | None,
+        tlp_option(
+            "TLP 2.0 marking written into the exported formats (default: AMBER). Formats without a "
+            "marking slot (openvex, csv, emass) ignore it."
+        ),
+    ] = None,
     _json: output.JsonFlag = False,
     _expand: output.ExpandFlag = False,
 ) -> None:
     """Submit text + files to the Artifact Enricher engine unless a subcommand was named."""
     if ctx.invoked_subcommand is not None:
         return
-    enrich_artifact_cmd.artifact_enrich_command(text=text, files=files, depth=depth, output_path=output_path, save=save)
+    enrich_artifact_cmd.artifact_enrich_command(
+        text=text,
+        files=files,
+        attached_artifact_ids=attached_artifact_ids,
+        depth=depth,
+        output_path=output_path,
+        save=save,
+        tlp=tlp_value(tlp),
+    )
 
 
 @artifact_enrich_app.command("status", help="Read one artifact-enrichment job's status and stages.")
@@ -193,6 +229,15 @@ def inventory_enrich(
             "--attachments-text", help="Free text for the engine's artifact-enrichment stage.", show_default=False
         ),
     ] = None,
+    attached_artifact_ids: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--attach-id",
+            help="Id of a stored artifact whose content is in --attachments-text (repeatable) — recorded on "
+            "the attachment report's sources.",
+            show_default=False,
+        ),
+    ] = None,
     _json: output.JsonFlag = False,
     _expand: output.ExpandFlag = False,
 ) -> None:
@@ -204,6 +249,7 @@ def inventory_enrich(
         products=products,
         include=include,
         attachments_text=attachments_text,
+        attached_artifact_ids=attached_artifact_ids,
     )
 
 
@@ -221,16 +267,68 @@ def inventory_enrich_status(
     enrich_inventory_cmd.inventory_enrich_status_command(enrichment_id)
 
 
+@event_enrich_app.callback(invoke_without_command=True)
+@handle_errors
+def event_enrich(
+    ctx: typer.Context,
+    event: Annotated[
+        str | None,
+        typer.Option("--event", help="The raw security event text to enrich (≤200k chars).", show_default=False),
+    ] = None,
+    event_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--event-file",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            show_default=False,
+            help="Read the raw security event from this file instead of --event.",
+        ),
+    ] = None,
+    event_id: Annotated[
+        str | None,
+        typer.Option("--event-id", help="Optional caller-side event id, echoed back on the result."),
+    ] = None,
+    output_path: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Write the full result JSON to a file instead of summarizing."),
+    ] = None,
+    _json: output.JsonFlag = False,
+    _expand: output.ExpandFlag = False,
+) -> None:
+    """Submit a raw security event to the Event Enricher unless a subcommand was named."""
+    if ctx.invoked_subcommand is not None:
+        return
+    enrich_event_cmd.event_enrich_command(
+        event=event, event_file=event_file, event_id=event_id, output_path=output_path
+    )
+
+
+@event_enrich_app.command("status", help="Read one event-enrichment job's status and stages.")
+@handle_errors
+def event_enrich_status(
+    enrichment_id: Annotated[
+        str,
+        typer.Argument(help="The enrichment id returned by the submit.", show_default=False),
+    ],
+    _json: output.JsonFlag = False,
+    _expand: output.ExpandFlag = False,
+) -> None:
+    """Forward to :func:`enrich_event_cmd.event_enrich_status_command`."""
+    enrich_event_cmd.event_enrich_status_command(enrichment_id)
+
+
 @app.command(
     "ingest",
-    help="Parse a scan/inventory file (any of 11 formats), enrich the assets, and emit a ranked briefing.",
+    help="Parse a scan/inventory file (any of 12 formats), enrich the assets, and emit a ranked briefing.",
 )
 @handle_errors
 def ingest(
     scan_format: Annotated[
         str,
         typer.Argument(
-            help="Scan/inventory format: json/sbom/csv/nmap/list/grype/trivy/depcheck/nessus/gvm/xlsx.",
+            help="Scan/inventory format: json/sbom/csv/nmap/list/grype/trivy/depcheck/nessus/gvm/xlsx/vex.",
             show_default=False,
         ),
     ],

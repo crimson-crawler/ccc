@@ -92,6 +92,7 @@ def inventory_enrich_command(
     products: list[str] | None = None,
     include: list[str] | None = None,
     attachments_text: str | None = None,
+    attached_artifact_ids: list[str] | None = None,
 ) -> None:
     """Submit assets to the ``/v1/inventory-enrich`` engine and print the job id."""
     assets = _load_assets(items_file, products)
@@ -103,6 +104,7 @@ def inventory_enrich_command(
                 assets,
                 include=include,
                 attachments_text=attachments_text,
+                attached_artifact_ids=list(attached_artifact_ids) if attached_artifact_ids else None,
             )
             return response.to_dict()
 

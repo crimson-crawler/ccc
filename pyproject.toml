@@ -1,6 +1,6 @@
 [project]
 name = "crimson-crawler-cli"
-version = "5.0.0"
+version = "5.0.1"
 description = "Command-line interface for the Crimson Crawler API"
 dynamic = ["readme"]  # supplied by hatch_build.py:PackagedReadmeUrls
 requires-python = ">=3.11"

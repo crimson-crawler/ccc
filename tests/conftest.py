@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from crimson_crawler_cli import config
+# Typer forces a colour terminal when GITHUB_ACTIONS is set, read once at import. The
+# help-text assertions compare plain text, so the exported repository's workflows got
+# ANSI codes in the captured output and failed. This is Typer's own switch for tests.
+os.environ["_TYPER_FORCE_DISABLE_TERMINAL"] = "1"
+
+from crimson_crawler_cli import config  # noqa: E402
 
 
 def _generated_tree_present() -> bool:
